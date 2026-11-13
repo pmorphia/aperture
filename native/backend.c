@@ -884,6 +884,7 @@ void ap_request_close(void) {
     A.closing = true;
 }
 static void audio_update(void);
+void ap_screenshot(const char *path);
 static void to_logical(float px, float py, float *x, float *y) {
     /* Window points to the coordinates of the window's drawing area: the same thing, unless
        a virtual size letterboxes it. */
@@ -982,6 +983,15 @@ static void present(void) {
 bool ap_frame(void) {
     if (!ready())
         return false;
+    /* APERTURE_FRAMES=n ends the loop after n frames, and APERTURE_SCREENSHOT=path saves the
+       last one: for running a game unattended (tests, CI, thumbnails). */
+    const char *limit = getenv("APERTURE_FRAMES");
+    if (limit && *limit && A.frame_started && A.frames >= atol(limit)) {
+        const char *shot = getenv("APERTURE_SCREENSHOT");
+        if (shot && *shot && !A.closing)
+            ap_screenshot(shot);
+        A.closing = true;
+    }
     if (A.frame_started)
         present();
     A.frame_started = true;

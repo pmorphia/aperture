@@ -1,0 +1,269 @@
+# Hollow Orbit: a top-down shooter. Move with WASD or the left stick, aim with the mouse or the
+# right stick, and hold the left button or the right trigger to fire. Drones come in waves.
+#
+#     flywheel run examples/shooter.fw
+#
+# Shows many moving things kept in arrays of structs (bullets and drones allocate nothing per
+# frame), aiming through a camera, screen shake, additive glow, and synthesized sound.
+import "../aperture.fw" as ap
+import math
+
+const double ARENA = 900
+
+struct Bullet
+    ap.Vec2 position
+    ap.Vec2 velocity
+    double life = 1.2
+end
+
+struct Drone
+    ap.Vec2 position
+    ap.Vec2 velocity
+    double health = 2
+    double radius = 11
+    double hurt = 0      # seconds left of the white flash after a hit
+    int kind = 0         # 0 chases, 1 circles and is faster
+end
+
+ap.open("Hollow Orbit", 1280, 720, ap.RESIZABLE)
+
+var shot = ap.tone(ap.WAVE_SQUARE, 880, 0.07, 220, 0.18)
+var pop = ap.tone(ap.WAVE_NOISE, 500, 0.25, 90, 0.4)
+var hit = ap.tone(ap.WAVE_SAW, 220, 0.5, 55, 0.5)
+var next_wave = ap.tone(ap.WAVE_TRIANGLE, 440, 0.4, 880, 0.3)
+
+var blast = ap.Particles()
+blast.start = ap.ORANGE
+blast.finish = ap.RED.fade(0)
+blast.speed = 260
+blast.limit = 4000
+var trail = ap.Particles()
+trail.start = ap.CYAN.fade(0.6)
+trail.finish = ap.BLUE.fade(0)
+trail.speed = 30
+trail.life = 0.3
+trail.size = 4
+
+var player = ap.Vec2(0, 0)
+var velocity = ap.Vec2(0, 0)
+var aim = ap.Vec2(1, 0)
+Bullet[] bullets = []
+Drone[] drones = []
+var cooldown = 0.0
+var health = 5
+var safe = 0.0
+var score = 0
+var best = 0
+var wave = 0
+var shake = 0.0
+var alive = false
+var started = false
+
+function start()
+    player = ap.Vec2(0, 0)
+    velocity = ap.Vec2(0, 0)
+    bullets = []
+    drones = []
+    health = 5
+    safe = 1.5
+    score = 0
+    wave = 0
+    alive = true
+    started = true
+end
+
+# Each wave brings more drones, placed on a ring around the player.
+function spawn_wave()
+    wave += 1
+    next_wave.play(0.5)
+    for i in 0..<4 + wave * 3 do
+        var from = player + ap.random_direction() * ap.random(420, 640)
+        var kind = 1 if ap.chance(math.min(0.1 * double(wave), 0.5)) else 0
+        drones.push(Drone(from, ap.Vec2(0, 0), 2 if kind == 0 else 1, 11 if kind == 0 else 8, 0, kind))
+    end
+end
+
+function update(double dt, ap.Camera2D camera)
+    velocity = velocity.lerp(ap.steer() * 300, math.min(dt * 10, 1.0))
+    player = player + velocity * dt
+    player = ap.Vec2(math.clamp(player.x, -ARENA, ARENA), math.clamp(player.y, -ARENA, ARENA))
+    if velocity.length() > 60 and ap.chance(dt * 40) do
+        trail.burst(player - velocity.normalized() * 10, 1)
+    end
+
+    # The right stick aims when it is pushed; otherwise the mouse does.
+    var stick = ap.pad_stick(true)
+    if stick.length() > 0.3 do
+        aim = stick.normalized()
+    else do
+        var toward = ap.to_world(camera, ap.mouse()) - player
+        if toward.length() > 1 do
+            aim = toward.normalized()
+        end
+    end
+
+    cooldown = math.max(cooldown - dt, 0.0)
+    safe = math.max(safe - dt, 0.0)
+    var firing = ap.mouse_down() or ap.key_down(ap.KEY_SPACE) or ap.pad_axis(ap.AXIS_RIGHT_TRIGGER) > 0.3
+    if firing and cooldown <= 0 do
+        cooldown = 0.09
+        var spread = aim.rotated(ap.random(-3, 3))
+        bullets.push(Bullet(player + spread * 16, spread * 760 + velocity * 0.3))
+        shot.play(0.15, ap.random(0.9, 1.1))
+        shake = math.max(shake, 0.04)
+    end
+
+    # Bullets fly straight, and stop at the first drone they touch.
+    Bullet[] flying = []
+    for bullet in bullets do
+        var position = bullet.position + bullet.velocity * dt
+        var life = bullet.life - dt
+        var spent = life <= 0 or math.abs(position.x) > ARENA + 40 or math.abs(position.y) > ARENA + 40
+        if not spent do
+            for i in 0..<drones.length do
+                var drone = drones[i]
+                if drone.health > 0 and ap.circles_overlap(position, 4, drone.position, drone.radius) do
+                    drones[i] = Drone(drone.position, drone.velocity + bullet.velocity * 0.12,
+                        drone.health - 1, drone.radius, 0.08, drone.kind)
+                    blast.burst(position, 4, bullet.velocity.angle() + 180, 70)
+                    spent = true
+                    break
+                end
+            end
+        end
+        if not spent do
+            flying.push(Bullet(position, bullet.velocity, life))
+        end
+    end
+    bullets = flying
+
+    Drone[] remaining = []
+    for drone in drones do
+        if drone.health <= 0 do
+            score += 10 if drone.kind == 0 else 25
+            pop.play(0.35, ap.random(0.8, 1.3))
+            blast.burst(drone.position, 22)
+            shake = math.max(shake, 0.12)
+            continue
+        end
+        var toward = (player - drone.position).normalized()
+        var want = toward * 120
+        if drone.kind == 1 do
+            # Circlers approach along a curve.
+            want = (toward + toward.rotated(90) * 0.9).normalized() * 210
+        end
+        var moving = drone.velocity.lerp(want, math.min(dt * 3, 1.0))
+        var position = drone.position + moving * dt
+        if safe <= 0 and ap.circles_overlap(player, 10, position, drone.radius) do
+            health -= 1
+            safe = 1.2
+            shake = 0.4
+            hit.play(0.6)
+            blast.burst(player, 30)
+            moving = toward * -260
+        end
+        remaining.push(Drone(position, moving, drone.health, drone.radius, math.max(drone.hurt - dt, 0.0),
+            drone.kind))
+    end
+    drones = remaining
+
+    if drones.length == 0 do
+        spawn_wave()
+    end
+    if health <= 0 do
+        alive = false
+        best = math.max(best, score)
+    end
+end
+
+function draw(ap.Camera2D camera)
+    ap.clear(ap.Color(10, 12, 26))
+    ap.begin_camera(camera)
+    # The floor: a grid, and the arena's edge.
+    var step = 60.0
+    var lines = int(ARENA / step)
+    for i in -lines..lines do
+        var at = double(i) * step
+        ap.line(at, -ARENA, at, ARENA, 1, ap.WHITE.fade(0.05))
+        ap.line(-ARENA, at, ARENA, at, 1, ap.WHITE.fade(0.05))
+    end
+    ap.rect_lines(-ARENA, -ARENA, ARENA * 2, ARENA * 2, 3, ap.PURPLE)
+
+    trail.draw()
+    ap.blend(ap.BLEND_ADD)
+    for bullet in bullets do
+        var tail = bullet.position - bullet.velocity.normalized() * 14
+        ap.segment(tail, bullet.position, 3, ap.YELLOW)
+        ap.circle(bullet.position.x, bullet.position.y, 6, ap.ORANGE.fade(0.25))
+    end
+    blast.draw()
+    ap.blend(ap.BLEND_ALPHA)
+
+    for drone in drones do
+        var color = ap.RED if drone.kind == 0 else ap.PINK
+        if drone.hurt > 0 do
+            color = ap.WHITE
+        end
+        ap.push()
+        ap.translate(drone.position.x, drone.position.y)
+        ap.rotate(ap.time() * (120.0 if drone.kind == 0 else 300.0))
+        var r = drone.radius
+        if drone.kind == 0 do
+            ap.rect(-r, -r, r * 2, r * 2, color)
+            ap.rect(-r * 0.4, -r * 0.4, r * 0.8, r * 0.8, ap.Color(10, 12, 26))
+        else do
+            ap.triangle(ap.Vec2(0, -r * 1.3), ap.Vec2(r * 1.1, r), ap.Vec2(-r * 1.1, r), color)
+        end
+        ap.pop()
+    end
+
+    # The ship blinks while it cannot be hurt.
+    if alive and (safe <= 0 or int(ap.time() * 14) % 2 == 0) do
+        ap.push()
+        ap.translate(player.x, player.y)
+        ap.rotate(aim.angle())
+        ap.triangle(ap.Vec2(16, 0), ap.Vec2(-10, -10), ap.Vec2(-10, 10), ap.CYAN)
+        ap.triangle(ap.Vec2(6, 0), ap.Vec2(-6, -5), ap.Vec2(-6, 5), ap.WHITE)
+        ap.pop()
+    end
+    ap.end_camera()
+
+    # A crosshair where the mouse is.
+    var pointer = ap.mouse()
+    ap.circle_lines(pointer.x, pointer.y, 8, 1.5, ap.WHITE.fade(0.7))
+    ap.text("SCORE {score}", 20, 16, 24)
+    ap.text("WAVE {wave}   BEST {best}", 20, 46, 16, ap.GRAY)
+    for i in 0..<health do
+        ap.rect(ap.width() - 36 - double(i) * 28, 20, 20, 20, ap.CYAN)
+    end
+    if not alive do
+        ap.rect(0, 0, ap.width(), ap.height(), ap.BLACK.fade(0.6))
+        var title = "HOLLOW ORBIT" if not started else "SHIP LOST"
+        ap.text_centered(title, ap.width() / 2, ap.height() / 2 - 70, 64, ap.CYAN)
+        if started do
+            ap.text_centered("{score} points, wave {wave}", ap.width() / 2, ap.height() / 2 + 10, 24)
+        end
+        ap.text_centered("Enter to launch - WASD moves, mouse aims and fires", ap.width() / 2,
+            ap.height() / 2 + 60, 16, ap.LIGHT_GRAY)
+    end
+end
+
+var eye = ap.Vec2(0, 0)
+while ap.frame() do
+    var dt = ap.delta()
+    eye = eye.lerp(player + aim * 60, math.min(dt * 5, 1.0))
+    var camera = ap.camera_at(eye + ap.random_direction() * (shake * 22))
+    if alive do
+        update(dt, camera)
+    else if ap.key_pressed(ap.KEY_ENTER) or ap.pad_pressed(ap.PAD_START) do
+        start()
+    end
+    shake = math.max(shake - dt, 0.0)
+    blast.update()
+    trail.update()
+    if ap.key_pressed(ap.KEY_ESCAPE) do
+        ap.quit()
+    end
+    draw(camera)
+end
+ap.close()

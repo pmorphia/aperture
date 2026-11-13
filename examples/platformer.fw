@@ -1,0 +1,272 @@
+# Cinder Climb: a platformer. Run and jump to the beacon at the far end, collecting embers on
+# the way. Lava sends you back to the start.
+#
+#     flywheel run examples/platformer.fw
+#
+# Shows a tile map built from text, collision with tiles, variable-height jumps with coyote
+# time and jump buffering, a camera that follows the player, particles, and a HUD drawn over
+# the world.
+import "../aperture.fw" as ap
+import math
+
+const double TILE = 16
+const double GRAVITY = 900
+const double RUN = 130
+const double JUMP = 310
+
+# '#' is ground, '=' a platform block, '^' lava, 'o' an ember, 'P' the start, 'B' the beacon.
+const string[] LEVEL = [
+    "#..............................................................................#",
+    "#..............................................................................#",
+    "#..............................................................................#",
+    "#.....................................o.o......................................#",
+    "#....................................=====..............o......................#",
+    "#...........o..................................o.......===.................B...#",
+    "#..........===.........o.....==..............=====...............o........###..#",
+    "#.....................===...........................o...........===......#####.#",
+    "#.....o...........==.........................o.....===.....==...........#######.",
+    "#.P..===....=..........................##...===...........................#####.",
+    "####......####....###^^^^###...###^^^^####^^^^^^^####^^^^^^####^^^^####..#######",
+    "##############################################################################.."
+]
+
+struct Ember
+    ap.Vec2 position
+    bool taken = false
+end
+
+ap.open("Cinder Climb", 1280, 720, ap.RESIZABLE)
+ap.virtual_size(320, 180)
+
+var map = ap.Tilemap(LEVEL[0].length, LEVEL.length, TILE)
+var start = ap.Vec2(0, 0)
+var beacon = ap.Vec2(0, 0)
+Ember[] embers = []
+for row, line in LEVEL do
+    for column in 0..<line.length do
+        var mark = line[column]
+        var spot = ap.Vec2((double(column) + 0.5) * TILE, (double(row) + 0.5) * TILE)
+        if mark == '#' do
+            map.set(column, row, 1)
+        else if mark == '=' do
+            map.set(column, row, 2)
+        else if mark == '^' do
+            map.set(column, row, 3)
+        else if mark == 'o' do
+            embers.push(Ember(spot))
+        else if mark == 'P' do
+            start = spot
+        else if mark == 'B' do
+            beacon = spot
+        end
+    end
+end
+
+var hop = ap.tone(ap.WAVE_SQUARE, 330, 0.12, 660, 0.25)
+var pick = ap.tone(ap.WAVE_TRIANGLE, 880, 0.12, 1320, 0.35)
+var burn = ap.tone(ap.WAVE_NOISE, 300, 0.4, 60, 0.45)
+var win = ap.tone(ap.WAVE_TRIANGLE, 523, 0.7, 1046, 0.4)
+
+var dust = ap.Particles()
+dust.start = ap.LIGHT_GRAY
+dust.finish = ap.GRAY.fade(0)
+dust.speed = 40
+dust.life = 0.35
+dust.size = 3
+var sparks = ap.Particles()
+sparks.gravity = ap.Vec2(0, 300)
+sparks.speed = 90
+
+var body = ap.Rect(0, 0, 10, 14)
+var velocity = ap.Vec2(0, 0)
+var grounded = false
+var coyote = 0.0        # seconds since leaving the ground in which a jump still counts
+var buffered = 0.0      # seconds a jump press is remembered before landing
+var facing = 1.0
+var collected = 0
+var falls = 0
+var finished = false
+var view = ap.Vec2(160, 90)
+
+function respawn()
+    body = ap.Rect(start.x - 5, start.y - 7, 10, 14)
+    velocity = ap.Vec2(0, 0)
+end
+respawn()
+
+# Whether the player's feet or body touch a lava tile.
+function in_lava() returns bool
+    var feet = ap.Vec2(body.x + body.w / 2, body.y + body.h + 1)
+    return map.at(feet) == 3 or map.at(body.center()) == 3
+end
+
+function jump_pressed() returns bool
+    return ap.key_pressed(ap.KEY_SPACE) or ap.key_pressed(ap.KEY_UP) or ap.key_pressed(ap.KEY_W) or
+        ap.pad_pressed(ap.PAD_SOUTH)
+end
+function jump_held() returns bool
+    return ap.key_down(ap.KEY_SPACE) or ap.key_down(ap.KEY_UP) or ap.key_down(ap.KEY_W) or
+        ap.pad_down(ap.PAD_SOUTH)
+end
+
+function update(double dt)
+    var steer = ap.steer().x
+    var grip = 14.0 if grounded else 7.0
+    velocity = ap.Vec2(ap.lerp(velocity.x, steer * RUN, math.min(dt * grip, 1.0)),
+        math.min(velocity.y + GRAVITY * dt, 420.0))
+    if steer != 0 do
+        facing = 1.0 if steer > 0 else -1.0
+    end
+
+    coyote = 0.1 if grounded else math.max(coyote - dt, 0.0)
+    buffered = 0.12 if jump_pressed() else math.max(buffered - dt, 0.0)
+    if buffered > 0 and coyote > 0 do
+        velocity = ap.Vec2(velocity.x, -JUMP)
+        buffered = 0
+        coyote = 0
+        hop.play(0.4)
+        dust.burst(ap.Vec2(body.x + body.w / 2, body.bottom()), 6, 270, 120)
+    end
+    # Letting go early cuts the jump short.
+    if velocity.y < -90 and not jump_held() do
+        velocity = ap.Vec2(velocity.x, -90)
+    end
+
+    # Lava does not block; ground and platforms do.
+    var before = body
+    var was_grounded = grounded
+    body = solid_slide(body, velocity * dt)
+    if body.x == before.x do
+        velocity = ap.Vec2(0, velocity.y)
+    end
+    grounded = false
+    if body.y == before.y and velocity.y != 0 do
+        grounded = velocity.y > 0
+        velocity = ap.Vec2(velocity.x, 0)
+    end
+    if grounded and not was_grounded do
+        dust.burst(ap.Vec2(body.x + body.w / 2, body.bottom()), 5, 270, 160)
+    end
+
+    for i in 0..<embers.length do
+        var ember = embers[i]
+        if not ember.taken and ap.circle_overlaps_rect(ember.position, 5, body) do
+            embers[i] = Ember(ember.position, true)
+            collected += 1
+            pick.play(0.5, 1 + double(collected % 6) * 0.08)
+            sparks.burst(ember.position, 14)
+        end
+    end
+
+    if in_lava() or body.y > double(map.rows) * TILE do
+        falls += 1
+        burn.play(0.6)
+        sparks.burst(body.center(), 30, 270, 90)
+        respawn()
+    end
+    if not finished and body.center().distance(beacon) < 14 do
+        finished = true
+        win.play(0.6)
+        sparks.burst(beacon, 60)
+    end
+end
+
+# Tilemap.slide, but lava tiles let the body through.
+function solid_slide(ap.Rect from, ap.Vec2 motion) returns ap.Rect
+    var moved = from
+    var across = ap.Rect(moved.x + motion.x, moved.y, moved.w, moved.h)
+    if not solid(across) do
+        moved = across
+    end
+    var down = ap.Rect(moved.x, moved.y + motion.y, moved.w, moved.h)
+    if not solid(down) do
+        moved = down
+    end
+    return moved
+end
+function solid(ap.Rect area) returns bool
+    var left = int(math.floor(area.x / TILE))
+    var right = int(math.floor((area.x + area.w - 0.0001) / TILE))
+    var top = int(math.floor(area.y / TILE))
+    var bottom = int(math.floor((area.y + area.h - 0.0001) / TILE))
+    for row in top..bottom do
+        for column in left..right do
+            var tile = map.get(column, row)
+            if tile == 1 or tile == 2 do
+                return true
+            end
+        end
+    end
+    return false
+end
+
+function draw()
+    ap.gradient(0, 0, 320, 180, ap.Color(24, 20, 48), ap.Color(86, 40, 60))
+    # Distant hills scroll slower than the world.
+    for i in 0..<9 do
+        var x = double(i) * 90 - (view.x * 0.3) % 90
+        ap.triangle(ap.Vec2(x - 70, 180), ap.Vec2(x, 96 + double(i % 3) * 14), ap.Vec2(x + 70, 180),
+            ap.Color(44, 30, 62))
+    end
+
+    ap.begin_camera(ap.camera_at(view))
+    var glow = 0.75 + 0.25 * ap.pulse(0.6)
+    map.draw_colors([ap.Color(70, 60, 84), ap.Color(120, 96, 110),
+        ap.Color(255, 120, 30).brightness(glow)])
+    for ember in embers do
+        if not ember.taken do
+            var bob = math.sin(ap.time() * 4 + ember.position.x) * 2
+            ap.circle(ember.position.x, ember.position.y + bob, 5, ap.ORANGE.fade(0.3))
+            ap.circle(ember.position.x, ember.position.y + bob, 2.5, ap.YELLOW)
+        end
+    end
+    # The beacon.
+    ap.rect(beacon.x - 2, beacon.y - 8, 4, 16, ap.BROWN)
+    var flame = ap.YELLOW if finished else ap.GRAY
+    ap.circle(beacon.x, beacon.y - 12, 5 + (2 * ap.pulse(0.4) if finished else 0.0), flame)
+
+    dust.draw()
+    sparks.draw()
+    # The player: a body, and an eye on the side it faces.
+    ap.fill(body, ap.CYAN)
+    ap.rect(body.x + body.w / 2 + facing * 2 - 1, body.y + 3, 2, 3, ap.NAVY)
+    ap.end_camera()
+
+    ap.text("EMBERS {collected}/{embers.length}", 6, 6, 8)
+    ap.text("FALLS {falls}", 6, 18, 8, ap.GRAY)
+    if finished do
+        ap.text_centered("THE BEACON IS LIT", 160, 60, 16, ap.YELLOW)
+        ap.text_centered("Enter to climb again", 160, 84, 8, ap.LIGHT_GRAY)
+    else if ap.time() < 6 do
+        ap.text_centered("Arrows or A/D to run, Space to jump", 160, 36, 8, ap.LIGHT_GRAY)
+    end
+end
+
+while ap.frame() do
+    var dt = ap.delta()
+    if not finished do
+        update(dt)
+    else if ap.key_pressed(ap.KEY_ENTER) or ap.pad_pressed(ap.PAD_START) do
+        finished = false
+        collected = 0
+        falls = 0
+        for i in 0..<embers.length do
+            embers[i] = Ember(embers[i].position)
+        end
+        respawn()
+    end
+    dust.update()
+    sparks.update()
+    if ap.key_pressed(ap.KEY_ESCAPE) do
+        ap.quit()
+    end
+
+    # The camera eases toward the player and stays inside the level.
+    var wide = double(map.columns) * TILE
+    var tall = double(map.rows) * TILE
+    var want = ap.Vec2(math.clamp(body.center().x + facing * 24, 160.0, wide - 160),
+        math.clamp(body.center().y - 10, 90.0, tall - 90))
+    view = view.lerp(want, math.min(dt * 6, 1.0))
+    draw()
+end
+ap.close()
