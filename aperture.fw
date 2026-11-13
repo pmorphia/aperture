@@ -1,0 +1,1728 @@
+# Aperture: 2D and 3D games in Flywheel.
+#
+#     import aperture as ap
+#
+#     ap.open("Hello", 800, 450)
+#     while ap.frame() do
+#         ap.clear(ap.NAVY)
+#         ap.text("Hello, Aperture!", 24, 24, 32)
+#     end
+#     ap.close()
+#
+# Coordinates are doubles with y pointing down in 2D and up in 3D, angles are degrees, and
+# colors are 0 to 255. Drawing happens between two calls of frame().
+import c native.backend as nat
+import gc
+import math
+
+# --- Values ----------------------------------------------------------------------------------
+
+# A point or direction in 2D.
+struct Vec2
+    double x = 0
+    double y = 0
+
+    function operator +(Vec2 other) returns Vec2
+        return Vec2(this.x + other.x, this.y + other.y)
+    end
+    function operator -(Vec2 other) returns Vec2
+        return Vec2(this.x - other.x, this.y - other.y)
+    end
+    function operator *(double k) returns Vec2
+        return Vec2(this.x * k, this.y * k)
+    end
+    function operator /(double k) returns Vec2
+        return Vec2(this.x / k, this.y / k)
+    end
+    function operator -() returns Vec2
+        return Vec2(-this.x, -this.y)
+    end
+    function length() returns double
+        return math.sqrt(this.x * this.x + this.y * this.y)
+    end
+    function length_squared() returns double
+        return this.x * this.x + this.y * this.y
+    end
+    # The same direction with length 1 (a zero vector stays zero).
+    function normalized() returns Vec2
+        var size = this.length()
+        if size < 0.000000001 do
+            return Vec2(0, 0)
+        end
+        return Vec2(this.x / size, this.y / size)
+    end
+    function dot(Vec2 other) returns double
+        return this.x * other.x + this.y * other.y
+    end
+    # The z of the 3D cross product: positive when `other` is clockwise from this (y down).
+    function cross(Vec2 other) returns double
+        return this.x * other.y - this.y * other.x
+    end
+    function distance(Vec2 other) returns double
+        return (this - other).length()
+    end
+    # The angle of the vector in degrees, clockwise from +x (y points down).
+    function angle() returns double
+        return math.atan2(this.y, this.x) * 180 / math.PI
+    end
+    function rotated(double degrees) returns Vec2
+        var a = degrees * math.PI / 180
+        var c = math.cos(a)
+        var s = math.sin(a)
+        return Vec2(this.x * c - this.y * s, this.x * s + this.y * c)
+    end
+    # Each component multiplied by the other's.
+    function scaled(Vec2 other) returns Vec2
+        return Vec2(this.x * other.x, this.y * other.y)
+    end
+    function lerp(Vec2 to, double t) returns Vec2
+        return Vec2(this.x + (to.x - this.x) * t, this.y + (to.y - this.y) * t)
+    end
+    # At most `step` closer to `to`.
+    function toward(Vec2 to, double step) returns Vec2
+        var delta = to - this
+        var distance = delta.length()
+        if distance <= step or distance < 0.000000001 do
+            return to
+        end
+        return this + delta * (step / distance)
+    end
+    # The vector cut down to at most `limit` long.
+    function limited(double limit) returns Vec2
+        var size = this.length()
+        if size <= limit or size < 0.000000001 do
+            return this
+        end
+        return this * (limit / size)
+    end
+    # The unit vector at an angle in degrees.
+    static function from_angle(double degrees) returns Vec2
+        var a = degrees * math.PI / 180
+        return Vec2(math.cos(a), math.sin(a))
+    end
+end
+
+# A point or direction in 3D (y is up).
+struct Vec3
+    double x = 0
+    double y = 0
+    double z = 0
+
+    function operator +(Vec3 other) returns Vec3
+        return Vec3(this.x + other.x, this.y + other.y, this.z + other.z)
+    end
+    function operator -(Vec3 other) returns Vec3
+        return Vec3(this.x - other.x, this.y - other.y, this.z - other.z)
+    end
+    function operator *(double k) returns Vec3
+        return Vec3(this.x * k, this.y * k, this.z * k)
+    end
+    function operator /(double k) returns Vec3
+        return Vec3(this.x / k, this.y / k, this.z / k)
+    end
+    function operator -() returns Vec3
+        return Vec3(-this.x, -this.y, -this.z)
+    end
+    function length() returns double
+        return math.sqrt(this.x * this.x + this.y * this.y + this.z * this.z)
+    end
+    function length_squared() returns double
+        return this.x * this.x + this.y * this.y + this.z * this.z
+    end
+    function normalized() returns Vec3
+        var size = this.length()
+        if size < 0.000000001 do
+            return Vec3(0, 0, 0)
+        end
+        return Vec3(this.x / size, this.y / size, this.z / size)
+    end
+    function dot(Vec3 other) returns double
+        return this.x * other.x + this.y * other.y + this.z * other.z
+    end
+    function cross(Vec3 other) returns Vec3
+        return Vec3(this.y * other.z - this.z * other.y, this.z * other.x - this.x * other.z,
+            this.x * other.y - this.y * other.x)
+    end
+    function distance(Vec3 other) returns double
+        return (this - other).length()
+    end
+    function scaled(Vec3 other) returns Vec3
+        return Vec3(this.x * other.x, this.y * other.y, this.z * other.z)
+    end
+    function lerp(Vec3 to, double t) returns Vec3
+        return Vec3(this.x + (to.x - this.x) * t, this.y + (to.y - this.y) * t,
+            this.z + (to.z - this.z) * t)
+    end
+end
+
+# A color: red, green, blue, and alpha (opacity), each 0 to 255.
+struct Color
+    int r = 255
+    int g = 255
+    int b = 255
+    int a = 255
+
+    # The same color at a different opacity, 0 (invisible) to 1.
+    function fade(double opacity) returns Color
+        return Color(this.r, this.g, this.b, int(math.round(math.clamp(opacity, 0.0, 1.0) * 255)))
+    end
+    function lerp(Color to, double t) returns Color
+        return Color(mix(this.r, to.r, t), mix(this.g, to.g, t), mix(this.b, to.b, t),
+            mix(this.a, to.a, t))
+    end
+    # Lighter (factor above 1) or darker (below 1).
+    function brightness(double factor) returns Color
+        return Color(scale_channel(this.r, factor), scale_channel(this.g, factor),
+            scale_channel(this.b, factor), this.a)
+    end
+    # The color packed as red, green, blue, alpha bytes (as read_pixel returns it).
+    function packed() returns int
+        return ((this.r * 256 + this.g) * 256 + this.b) * 256 + this.a
+    end
+end
+
+private function mix(int from, int to, double t) returns int
+    return int(math.round(double(from) + double(to - from) * t))
+end
+private function scale_channel(int value, double factor) returns int
+    return int(math.clamp(math.round(double(value) * factor), 0.0, 255.0))
+end
+
+# A color from "#rrggbb", "#rrggbbaa", or "#rgb" (the # is optional).
+function hex(string text) returns Color
+    var digits = text
+    if digits.starts_with("#") do
+        digits = digits[1..<digits.length]
+    end
+    if digits.length == 3 do
+        var wide = ""
+        for c in digits do
+            wide = wide + c + c
+        end
+        digits = wide
+    end
+    if digits.length != 6 and digits.length != 8 do
+        throw ValueError("hex colors look like #rrggbb or #rrggbbaa, not '" + text + "'")
+    end
+    int[] parts = []
+    for i in 0..<digits.length // 2 do
+        parts.push(hex_digit(digits[i * 2]) * 16 + hex_digit(digits[i * 2 + 1]))
+    end
+    return Color(parts[0], parts[1], parts[2], parts[3] if parts.length == 4 else 255)
+end
+private function hex_digit(char c) returns int
+    var code = int(c)
+    if code >= 48 and code <= 57 do
+        return code - 48
+    end
+    if code >= 97 and code <= 102 do
+        return code - 87
+    end
+    if code >= 65 and code <= 70 do
+        return code - 55
+    end
+    throw ValueError("'" + c + "' is not a hexadecimal digit")
+end
+# A color from hue (degrees), saturation, and value (both 0 to 1).
+function hsv(double hue, double saturation, double value) returns Color
+    var h = (hue - math.floor(hue / 360) * 360) / 60
+    var c = value * saturation
+    var x = c * (1 - math.abs(h - math.floor(h / 2) * 2 - 1))
+    var m = value - c
+    var r = 0.0
+    var g = 0.0
+    var b = 0.0
+    if h < 1 do
+        r = c
+        g = x
+    else if h < 2 do
+        r = x
+        g = c
+    else if h < 3 do
+        g = c
+        b = x
+    else if h < 4 do
+        g = x
+        b = c
+    else if h < 5 do
+        r = x
+        b = c
+    else do
+        r = c
+        b = x
+    end
+    return Color(int(math.round((r + m) * 255)), int(math.round((g + m) * 255)),
+        int(math.round((b + m) * 255)), 255)
+end
+
+const WHITE = Color(255, 255, 255, 255)
+const BLACK = Color(0, 0, 0, 255)
+const TRANSPARENT = Color(0, 0, 0, 0)
+const GRAY = Color(130, 130, 130, 255)
+const LIGHT_GRAY = Color(200, 200, 200, 255)
+const DARK_GRAY = Color(60, 60, 68, 255)
+const RED = Color(230, 41, 55, 255)
+const ORANGE = Color(255, 150, 30, 255)
+const YELLOW = Color(253, 224, 60, 255)
+const GREEN = Color(40, 200, 90, 255)
+const LIME = Color(150, 230, 60, 255)
+const CYAN = Color(60, 210, 230, 255)
+const BLUE = Color(50, 120, 240, 255)
+const NAVY = Color(20, 28, 54, 255)
+const PURPLE = Color(150, 90, 230, 255)
+const PINK = Color(255, 110, 180, 255)
+const BROWN = Color(130, 90, 60, 255)
+const SKY = Color(120, 190, 255, 255)
+
+# A rectangle: its top left corner and size.
+struct Rect
+    double x = 0
+    double y = 0
+    double w = 0
+    double h = 0
+
+    function right() returns double
+        return this.x + this.w
+    end
+    function bottom() returns double
+        return this.y + this.h
+    end
+    function center() returns Vec2
+        return Vec2(this.x + this.w / 2, this.y + this.h / 2)
+    end
+    function position() returns Vec2
+        return Vec2(this.x, this.y)
+    end
+    function size() returns Vec2
+        return Vec2(this.w, this.h)
+    end
+    function contains(Vec2 point) returns bool
+        return point.x >= this.x and point.x < this.x + this.w and point.y >= this.y and
+            point.y < this.y + this.h
+    end
+    function overlaps(Rect other) returns bool
+        return this.x < other.x + other.w and other.x < this.x + this.w and
+            this.y < other.y + other.h and other.y < this.y + this.h
+    end
+    # The part both rectangles cover (zero size when they do not overlap).
+    function intersection(Rect other) returns Rect
+        var left = math.max(this.x, other.x)
+        var top = math.max(this.y, other.y)
+        var right = math.min(this.x + this.w, other.x + other.w)
+        var bottom = math.min(this.y + this.h, other.y + other.h)
+        if right <= left or bottom <= top do
+            return Rect(left, top, 0, 0)
+        end
+        return Rect(left, top, right - left, bottom - top)
+    end
+    function moved(Vec2 by) returns Rect
+        return Rect(this.x + by.x, this.y + by.y, this.w, this.h)
+    end
+    # Larger by `amount` on every side (smaller when negative).
+    function grown(double amount) returns Rect
+        return Rect(this.x - amount, this.y - amount, this.w + amount * 2, this.h + amount * 2)
+    end
+    # A rectangle of a size around a center point.
+    static function centered(Vec2 center, double w, double h) returns Rect
+        return Rect(center.x - w / 2, center.y - h / 2, w, h)
+    end
+end
+
+# --- Window ----------------------------------------------------------------------------------
+
+# Window options for open(), added together: aperture.RESIZABLE + aperture.MSAA.
+const int RESIZABLE = 1
+const int FULLSCREEN = 2
+const int NO_VSYNC = 4
+# No window on screen: for tests, tools, and rendering to files.
+const int HIDDEN = 8
+# Smooth edges (4x multisampling).
+const int MSAA = 16
+const int BORDERLESS = 32
+
+private double collector_budget = 0.001
+
+# Opens the game window. Only one window is open at a time.
+function open(string title, int width, int height, int options = 0)
+    nat.ap_open(title, width, height, options)
+end
+# Closes the window and frees everything loaded.
+function close()
+    nat.ap_close()
+end
+function is_open() returns bool
+    return nat.ap_is_open()
+end
+# Starts the next frame: shows what the last one drew, reads input, and advances the clock.
+# Returns false when the window should close, so a game is `while aperture.frame() do ... end`.
+function frame() returns bool
+    if collector_budget > 0 do
+        gc.step(collector_budget)
+    end
+    return nat.ap_frame()
+end
+# Asks the game loop to end: the next frame() returns false.
+function quit()
+    nat.ap_request_close()
+end
+# Seconds the last frame took, for movement that does not depend on the frame rate.
+function delta() returns double
+    return nat.ap_delta()
+end
+# Seconds since the window opened.
+function time() returns double
+    return nat.ap_time()
+end
+function fps() returns double
+    return nat.ap_fps()
+end
+function frame_count() returns int
+    return nat.ap_frame_count()
+end
+# Limits the frame rate (0 removes the limit; vsync still applies).
+function target_fps(int rate)
+    nat.ap_target_fps(rate)
+end
+function vsync(bool on)
+    nat.ap_vsync(on)
+end
+# How long frame() may spend collecting garbage cycles (default one millisecond; 0 leaves
+# collection to the runtime's own schedule).
+function collector_time(double seconds)
+    collector_budget = seconds
+end
+# The width of the drawing area: the virtual size, the canvas being drawn to, or the window.
+function width() returns double
+    return double(nat.ap_width())
+end
+function height() returns double
+    return double(nat.ap_height())
+end
+function size() returns Vec2
+    return Vec2(double(nat.ap_width()), double(nat.ap_height()))
+end
+function center() returns Vec2
+    return Vec2(double(nat.ap_width()) / 2, double(nat.ap_height()) / 2)
+end
+function window_size() returns Vec2
+    return Vec2(double(nat.ap_window_width()), double(nat.ap_window_height()))
+end
+# Draw in a fixed coordinate space scaled to fit the window, with bars at the sides when the
+# shapes differ. virtual_size(0, 0) turns it off.
+function virtual_size(int width, int height)
+    nat.ap_virtual_size(width, height)
+end
+function set_title(string title)
+    nat.ap_set_title(title)
+end
+function set_size(int width, int height)
+    nat.ap_set_size(width, height)
+end
+function fullscreen(bool on)
+    nat.ap_fullscreen(on)
+end
+function is_fullscreen() returns bool
+    return nat.ap_is_fullscreen()
+end
+function show_cursor(bool on)
+    nat.ap_show_cursor(on)
+end
+# Hides the cursor and reports unbounded motion (mouse_delta), for first-person cameras.
+function capture_mouse(bool on)
+    nat.ap_capture_mouse(on)
+end
+
+# --- Input -----------------------------------------------------------------------------------
+
+const int KEY_A = 4
+const int KEY_B = 5
+const int KEY_C = 6
+const int KEY_D = 7
+const int KEY_E = 8
+const int KEY_F = 9
+const int KEY_G = 10
+const int KEY_H = 11
+const int KEY_I = 12
+const int KEY_J = 13
+const int KEY_K = 14
+const int KEY_L = 15
+const int KEY_M = 16
+const int KEY_N = 17
+const int KEY_O = 18
+const int KEY_P = 19
+const int KEY_Q = 20
+const int KEY_R = 21
+const int KEY_S = 22
+const int KEY_T = 23
+const int KEY_U = 24
+const int KEY_V = 25
+const int KEY_W = 26
+const int KEY_X = 27
+const int KEY_Y = 28
+const int KEY_Z = 29
+const int KEY_1 = 30
+const int KEY_2 = 31
+const int KEY_3 = 32
+const int KEY_4 = 33
+const int KEY_5 = 34
+const int KEY_6 = 35
+const int KEY_7 = 36
+const int KEY_8 = 37
+const int KEY_9 = 38
+const int KEY_0 = 39
+const int KEY_ENTER = 40
+const int KEY_ESCAPE = 41
+const int KEY_BACKSPACE = 42
+const int KEY_TAB = 43
+const int KEY_SPACE = 44
+const int KEY_MINUS = 45
+const int KEY_EQUALS = 46
+const int KEY_LEFT_BRACKET = 47
+const int KEY_RIGHT_BRACKET = 48
+const int KEY_BACKSLASH = 49
+const int KEY_SEMICOLON = 51
+const int KEY_APOSTROPHE = 52
+const int KEY_GRAVE = 53
+const int KEY_COMMA = 54
+const int KEY_PERIOD = 55
+const int KEY_SLASH = 56
+const int KEY_CAPS_LOCK = 57
+const int KEY_F1 = 58
+const int KEY_F2 = 59
+const int KEY_F3 = 60
+const int KEY_F4 = 61
+const int KEY_F5 = 62
+const int KEY_F6 = 63
+const int KEY_F7 = 64
+const int KEY_F8 = 65
+const int KEY_F9 = 66
+const int KEY_F10 = 67
+const int KEY_F11 = 68
+const int KEY_F12 = 69
+const int KEY_INSERT = 73
+const int KEY_HOME = 74
+const int KEY_PAGE_UP = 75
+const int KEY_DELETE = 76
+const int KEY_END = 77
+const int KEY_PAGE_DOWN = 78
+const int KEY_RIGHT = 79
+const int KEY_LEFT = 80
+const int KEY_DOWN = 81
+const int KEY_UP = 82
+const int KEY_LEFT_CONTROL = 224
+const int KEY_LEFT_SHIFT = 225
+const int KEY_LEFT_ALT = 226
+const int KEY_RIGHT_CONTROL = 228
+const int KEY_RIGHT_SHIFT = 229
+const int KEY_RIGHT_ALT = 230
+
+const int MOUSE_LEFT = 1
+const int MOUSE_MIDDLE = 2
+const int MOUSE_RIGHT = 3
+
+# Gamepad buttons, named by position: SOUTH is A on an Xbox pad and Cross on a PlayStation one.
+const int PAD_SOUTH = 0
+const int PAD_EAST = 1
+const int PAD_WEST = 2
+const int PAD_NORTH = 3
+const int PAD_BACK = 4
+const int PAD_GUIDE = 5
+const int PAD_START = 6
+const int PAD_LEFT_STICK = 7
+const int PAD_RIGHT_STICK = 8
+const int PAD_LEFT_SHOULDER = 9
+const int PAD_RIGHT_SHOULDER = 10
+const int PAD_UP = 11
+const int PAD_DOWN = 12
+const int PAD_LEFT = 13
+const int PAD_RIGHT = 14
+
+const int AXIS_LEFT_X = 0
+const int AXIS_LEFT_Y = 1
+const int AXIS_RIGHT_X = 2
+const int AXIS_RIGHT_Y = 3
+const int AXIS_LEFT_TRIGGER = 4
+const int AXIS_RIGHT_TRIGGER = 5
+
+# Whether a key is held. Keys name positions on the keyboard (KEY_W is the key where W is on
+# a US layout), which is what movement keys want.
+function key_down(int key) returns bool
+    return nat.ap_key_down(key)
+end
+# Whether a key went down this frame.
+function key_pressed(int key) returns bool
+    return nat.ap_key_pressed(key)
+end
+function key_released(int key) returns bool
+    return nat.ap_key_released(key)
+end
+# A key that went down this frame, or 0.
+function any_key() returns int
+    return nat.ap_key_any()
+end
+# The key with a name such as "Space", "A", or "Left" (0 when there is none).
+function key_named(string name) returns int
+    return nat.ap_key_code(name)
+end
+function key_name(int key) returns string
+    return nat.ap_key_name(key)
+end
+# The text typed this frame, as the keyboard layout produces it.
+function typed() returns string
+    return nat.ap_text_input()
+end
+function mouse() returns Vec2
+    return Vec2(nat.ap_mouse_x(), nat.ap_mouse_y())
+end
+# How far the mouse moved this frame.
+function mouse_delta() returns Vec2
+    return Vec2(nat.ap_mouse_dx(), nat.ap_mouse_dy())
+end
+# Wheel movement this frame; y is positive scrolling up.
+function wheel() returns Vec2
+    return Vec2(nat.ap_wheel_x(), nat.ap_wheel_y())
+end
+function mouse_down(int button = 1) returns bool
+    return nat.ap_mouse_down(button)
+end
+function mouse_pressed(int button = 1) returns bool
+    return nat.ap_mouse_pressed(button)
+end
+function mouse_released(int button = 1) returns bool
+    return nat.ap_mouse_released(button)
+end
+function pad_connected(int pad = 0) returns bool
+    return nat.ap_gamepad_connected(pad)
+end
+function pad_name(int pad = 0) returns string
+    return nat.ap_gamepad_name(pad)
+end
+# A stick or trigger position from -1 to 1 (triggers 0 to 1).
+function pad_axis(int axis, int pad = 0) returns double
+    return nat.ap_gamepad_axis(pad, axis)
+end
+function pad_stick(bool right = false, int pad = 0) returns Vec2
+    if right do
+        return Vec2(nat.ap_gamepad_axis(pad, 2), nat.ap_gamepad_axis(pad, 3))
+    end
+    return Vec2(nat.ap_gamepad_axis(pad, 0), nat.ap_gamepad_axis(pad, 1))
+end
+function pad_down(int button, int pad = 0) returns bool
+    return nat.ap_gamepad_down(pad, button)
+end
+function pad_pressed(int button, int pad = 0) returns bool
+    return nat.ap_gamepad_pressed(pad, button)
+end
+# Shakes the controller: both strengths are 0 to 1.
+function pad_rumble(double low, double high, double seconds, int pad = 0)
+    nat.ap_gamepad_rumble(pad, low, high, seconds)
+end
+# The direction the player is steering: arrow keys, WASD, the d-pad, or the left stick, as a
+# vector no longer than 1 (y is down, as on screen).
+function steer(int pad = 0) returns Vec2
+    var x = 0.0
+    var y = 0.0
+    if nat.ap_key_down(KEY_LEFT) or nat.ap_key_down(KEY_A) or nat.ap_gamepad_down(pad, PAD_LEFT) do
+        x -= 1
+    end
+    if nat.ap_key_down(KEY_RIGHT) or nat.ap_key_down(KEY_D) or
+        nat.ap_gamepad_down(pad, PAD_RIGHT) do
+    x += 1
+end
+if nat.ap_key_down(KEY_UP) or nat.ap_key_down(KEY_W) or nat.ap_gamepad_down(pad, PAD_UP) do
+    y -= 1
+end
+if nat.ap_key_down(KEY_DOWN) or nat.ap_key_down(KEY_S) or nat.ap_gamepad_down(pad, PAD_DOWN) do
+    y += 1
+end
+var direction = Vec2(x + nat.ap_gamepad_axis(pad, 0), y + nat.ap_gamepad_axis(pad, 1))
+return direction.limited(1)
+end
+# Sends a key press or release as if typed, for tests and replays; the next frame sees it.
+function send_key(int key, bool down)
+    nat.ap_inject_key(key, down)
+end
+# Moves the mouse (in window coordinates) and optionally presses or releases a button.
+function send_mouse(Vec2 position, int button = 0, bool down = true)
+    nat.ap_inject_mouse(position.x, position.y, button, down)
+end
+
+# --- Drawing in 2D ---------------------------------------------------------------------------
+
+const int BLEND_ALPHA = 0
+# Colors add up: glows, fire, lasers.
+const int BLEND_ADD = 1
+const int BLEND_MULTIPLY = 2
+const int BLEND_PREMULTIPLIED = 3
+
+# Fills the drawing area with a color.
+function clear(Color color = BLACK)
+    nat.ap_clear(color.r, color.g, color.b, color.a)
+end
+function rect(double x, double y, double w, double h, Color color = WHITE)
+    nat.ap_rect(x, y, w, h, color.r, color.g, color.b, color.a)
+end
+function fill(Rect area, Color color = WHITE)
+    nat.ap_rect(area.x, area.y, area.w, area.h, color.r, color.g, color.b, color.a)
+end
+function rect_lines(double x, double y, double w, double h, double thickness = 1,
+        Color color = WHITE)
+    nat.ap_rect_lines(x, y, w, h, thickness, color.r, color.g, color.b, color.a)
+end
+function outline(Rect area, double thickness = 1, Color color = WHITE)
+    nat.ap_rect_lines(area.x, area.y, area.w, area.h, thickness, color.r, color.g, color.b,
+        color.a)
+end
+# A rectangle shading from one color at the top to another at the bottom.
+function gradient(double x, double y, double w, double h, Color top, Color bottom)
+    nat.ap_rect_gradient(x, y, w, h, top.packed(), top.packed(), bottom.packed(),
+        bottom.packed())
+end
+# A rectangle shading from one color at the left to another at the right.
+function gradient_across(double x, double y, double w, double h, Color left, Color right)
+    nat.ap_rect_gradient(x, y, w, h, left.packed(), right.packed(), right.packed(),
+        left.packed())
+end
+function line(double x1, double y1, double x2, double y2, double thickness = 1,
+        Color color = WHITE)
+    nat.ap_line(x1, y1, x2, y2, thickness, color.r, color.g, color.b, color.a)
+end
+function segment(Vec2 from, Vec2 to, double thickness = 1, Color color = WHITE)
+    nat.ap_line(from.x, from.y, to.x, to.y, thickness, color.r, color.g, color.b, color.a)
+end
+function circle(double x, double y, double radius, Color color = WHITE)
+    nat.ap_circle(x, y, radius, color.r, color.g, color.b, color.a)
+end
+function circle_lines(double x, double y, double radius, double thickness = 1,
+        Color color = WHITE)
+    nat.ap_circle_lines(x, y, radius, thickness, color.r, color.g, color.b, color.a)
+end
+function ellipse(double x, double y, double radius_x, double radius_y, Color color = WHITE)
+    nat.ap_ellipse(x, y, radius_x, radius_y, color.r, color.g, color.b, color.a)
+end
+# A pie slice of a circle between two angles (degrees, clockwise from the right).
+function sector(double x, double y, double radius, double from, double to, Color color = WHITE)
+    nat.ap_sector(x, y, radius, radius, from, to, color.r, color.g, color.b, color.a)
+end
+# Part of a circle's outline between two angles: progress rings, arcs.
+function arc(double x, double y, double radius, double from, double to, double thickness = 1,
+        Color color = WHITE)
+    nat.ap_ring(x, y, radius, radius, from, to, thickness, color.r, color.g, color.b, color.a)
+end
+function triangle(Vec2 a, Vec2 b, Vec2 c, Color color = WHITE)
+    nat.ap_triangle(a.x, a.y, b.x, b.y, c.x, c.y, color.r, color.g, color.b, color.a)
+end
+# A filled convex polygon.
+function polygon(Vec2[] points, Color color = WHITE)
+    nat.ap_polygon_begin()
+    for point in points do
+        nat.ap_polygon_point(point.x, point.y)
+    end
+    nat.ap_polygon_fill(color.r, color.g, color.b, color.a)
+end
+# Connected lines through points; `closed` joins the last to the first.
+function path(Vec2[] points, double thickness = 1, Color color = WHITE, bool closed = false)
+    nat.ap_polygon_begin()
+    for point in points do
+        nat.ap_polygon_point(point.x, point.y)
+    end
+    nat.ap_polygon_stroke(thickness, closed, color.r, color.g, color.b, color.a)
+end
+# How new drawing combines with what is there: BLEND_ALPHA (the default), BLEND_ADD,
+# BLEND_MULTIPLY, or BLEND_PREMULTIPLIED.
+function blend(int mode)
+    nat.ap_blend(mode)
+end
+# Limits drawing to a rectangle until unclip().
+function clip(Rect area)
+    nat.ap_scissor(area.x, area.y, area.w, area.h)
+end
+function unclip()
+    nat.ap_scissor(0, 0, 0, 0)
+end
+
+# Transforms apply to everything drawn in 2D until the matching pop().
+function push()
+    nat.ap_push()
+end
+function pop()
+    nat.ap_pop()
+end
+function translate(double x, double y)
+    nat.ap_translate(x, y)
+end
+function rotate(double degrees)
+    nat.ap_rotate(degrees)
+end
+function scale(double x, double y)
+    nat.ap_scale(x, y)
+end
+
+# A view of a 2D world: `target` is the world point shown at `offset` on screen.
+struct Camera2D
+    Vec2 target
+    Vec2 offset
+    double rotation = 0
+    double zoom = 1
+end
+# A camera that keeps a world point in the middle of the drawing area.
+function camera_at(Vec2 target, double zoom = 1) returns Camera2D
+    return Camera2D(target, center(), 0, zoom)
+end
+# Draw through a camera until end_camera().
+function begin_camera(Camera2D camera)
+    nat.ap_camera(camera.target.x, camera.target.y, camera.offset.x, camera.offset.y,
+        camera.rotation, camera.zoom)
+end
+function end_camera()
+    nat.ap_pop()
+end
+# The world point under a screen position, for a camera.
+function to_world(Camera2D camera, Vec2 screen) returns Vec2
+    var local = (screen - camera.offset).rotated(-camera.rotation) / camera.zoom
+    return local + camera.target
+end
+# Where a world point appears on screen, for a camera.
+function to_screen(Camera2D camera, Vec2 world) returns Vec2
+    return ((world - camera.target) * camera.zoom).rotated(camera.rotation) + camera.offset
+end
+
+# --- Textures --------------------------------------------------------------------------------
+
+# An image on the graphics card. Freed when no longer referenced, or by close().
+class Texture
+    readonly int id
+    readonly int width
+    readonly int height
+    private int session = 0
+
+    constructor(int id)
+        this.id = id
+        this.width = nat.ap_texture_width(id)
+        this.height = nat.ap_texture_height(id)
+        this.session = nat.ap_session()
+    end
+    destructor
+        this.free()
+    end
+    function free()
+        if this.session != 0 and this.session == nat.ap_session() do
+            nat.ap_texture_free(this.id)
+        end
+        this.session = 0
+    end
+    function size() returns Vec2
+        return Vec2(double(this.width), double(this.height))
+    end
+    # Whether scaling blends neighboring pixels (smooth) or keeps them crisp (pixel art).
+    function smooth(bool on)
+        nat.ap_texture_smooth(this.id, on)
+    end
+    # Whether the image repeats when drawn beyond its edges (tiling backgrounds, 3D floors).
+    function repeat(bool on)
+        nat.ap_texture_repeat(this.id, on)
+    end
+    # The whole image as a source rectangle.
+    function bounds() returns Rect
+        return Rect(0, 0, double(this.width), double(this.height))
+    end
+    # Cell `index` of a sprite sheet whose cells are `cell_w` by `cell_h`, counted left to
+    # right, top to bottom.
+    function cell(int index, int cell_w, int cell_h) returns Rect
+        var columns = math.max(this.width // cell_w, 1)
+        return Rect(double(index % columns * cell_w), double(index // columns * cell_h),
+            double(cell_w), double(cell_h))
+    end
+end
+
+# Loads a PNG or BMP image. Pass smooth = false for pixel art.
+function load_texture(string path, bool smooth = true) returns Texture
+    return Texture(nat.ap_texture_load(path, smooth))
+end
+# A texture painted pixel by pixel: `paint(x, y)` gives each pixel's color.
+function make_texture(int width, int height, function(int, int) returns Color paint,
+        bool smooth = false) returns Texture
+    nat.ap_pixels_begin(width, height)
+    for y in 0..<height do
+        for x in 0..<width do
+            var color = paint(x, y)
+            nat.ap_pixels_set(x, y, color.r, color.g, color.b, color.a)
+        end
+    end
+    return Texture(nat.ap_pixels_texture(smooth))
+end
+# A texture of RGBA bytes at a native address (from a native import of your own).
+function texture_from_memory(int address, int width, int height, bool smooth = true) returns Texture
+    return Texture(nat.ap_texture_from_memory(address, width, height, smooth))
+end
+# Draws a texture with its top left corner at (x, y).
+function sprite(Texture texture, double x, double y, Color tint = WHITE)
+    nat.ap_texture_draw(texture.id, 0, 0, double(texture.width), double(texture.height), x, y,
+        double(texture.width), double(texture.height), 0, 0, 0, tint.r, tint.g,
+        tint.b, tint.a)
+end
+# Draws a texture centered on a point, rotated and scaled.
+function sprite_at(Texture texture, Vec2 position, double rotation = 0, double scale = 1,
+        Color tint = WHITE)
+    var w = double(texture.width) * scale
+    var h = double(texture.height) * scale
+    nat.ap_texture_draw(texture.id, 0, 0, double(texture.width), double(texture.height),
+        position.x, position.y, w, h, w / 2, h / 2, rotation, tint.r, tint.g,
+        tint.b, tint.a)
+end
+# Draws part of a texture (`source`, in pixels) at the size of `target`, rotated around
+# `origin`: a point of the drawn image, measured from its top left, which is placed at the
+# target's x and y. With the default origin the target is simply where the image goes. A
+# source with negative width or height is mirrored.
+function sprite_part(Texture texture, Rect source, Rect target, Vec2 origin = Vec2(0, 0),
+        double rotation = 0, Color tint = WHITE)
+    nat.ap_texture_draw(texture.id, source.x, source.y, source.w, source.h, target.x, target.y,
+        target.w, target.h, origin.x, origin.y, rotation, tint.r, tint.g, tint.b,
+        tint.a)
+end
+
+# An off-screen drawing area, used as a texture afterwards: lighting layers, minimaps,
+# post-processing, pixel-perfect scaling.
+class Canvas
+    readonly int id
+    readonly Texture texture
+    private int session = 0
+
+    constructor(int width, int height, bool smooth = false)
+        var canvas = nat.ap_canvas_create(width, height, smooth)
+        this.id = canvas
+        this.texture = Texture(nat.ap_canvas_texture(canvas))
+        this.session = nat.ap_session()
+    end
+    destructor
+        this.free()
+    end
+    function free()
+        if this.session != 0 and this.session == nat.ap_session() do
+            nat.ap_canvas_free(this.id)
+        end
+        this.session = 0
+    end
+end
+# Draw to a canvas until draw_to_window().
+function draw_to(Canvas canvas)
+    nat.ap_canvas_target(canvas.id)
+end
+function draw_to_window()
+    nat.ap_canvas_target(0)
+end
+
+# A fragment shader for 2D drawing. The source defines
+# `vec4 effect(vec4 color, sampler2D image, vec2 uv)` in GLSL; `u_time` and `u_resolution` are
+# provided, and other uniforms it declares are set with set().
+class Shader
+    readonly int id
+    private int session = 0
+
+    constructor(string source)
+        this.id = nat.ap_shader_create(source)
+        this.session = nat.ap_session()
+    end
+    destructor
+        this.free()
+    end
+    function free()
+        if this.session != 0 and this.session == nat.ap_session() do
+            nat.ap_shader_free(this.id)
+        end
+        this.session = 0
+    end
+    function set(string name, double value)
+        nat.ap_shader_set(this.id, name, 1, value, 0, 0, 0)
+    end
+    function set_vec2(string name, Vec2 value)
+        nat.ap_shader_set(this.id, name, 2, value.x, value.y, 0, 0)
+    end
+    function set_vec3(string name, Vec3 value)
+        nat.ap_shader_set(this.id, name, 3, value.x, value.y, value.z, 0)
+    end
+    function set_color(string name, Color value)
+        nat.ap_shader_set(this.id, name, 4, double(value.r) / 255, double(value.g) / 255,
+            double(value.b) / 255, double(value.a) / 255)
+    end
+end
+# Draw with a shader until no_shader().
+function use_shader(Shader shader)
+    nat.ap_shader_use(shader.id)
+end
+function no_shader()
+    nat.ap_shader_use(0)
+end
+
+# The color at a position of the drawing area, as Color.packed() gives it.
+function read_pixel(double x, double y) returns int
+    return nat.ap_read_pixel(x, y)
+end
+# Saves the drawing area as a PNG (or BMP, by extension).
+function screenshot(string path)
+    nat.ap_screenshot(path)
+end
+
+# --- Text ------------------------------------------------------------------------------------
+
+# Glyphs in a texture. The built-in font needs no file; aperture.ttf loads TrueType fonts.
+class Font
+    readonly int id
+    private Texture? atlas = null
+    private int session = 0
+
+    # A font over an atlas texture whose glyphs are `pixel_size` tall; describe each
+    # character with glyph().
+    constructor(Texture atlas, double pixel_size, double line_height = 0)
+        this.id = nat.ap_font_create(atlas.id, pixel_size, line_height)
+        this.atlas = atlas
+        this.session = nat.ap_session()
+    end
+    destructor
+        this.free()
+    end
+    function free()
+        if this.session != 0 and this.session == nat.ap_session() do
+            nat.ap_font_free(this.id)
+        end
+        this.session = 0
+    end
+    # Where character `code` (0 to 255) is in the atlas, how far its corner is from the pen
+    # position, and how far the pen advances.
+    function glyph(int code, Rect area, Vec2 offset, double advance)
+        nat.ap_font_glyph(this.id, code, area.x, area.y, area.w, area.h, offset.x, offset.y,
+            advance)
+    end
+    # A font from a sheet of equal cells holding the characters from `first` on, row by row.
+    static function from_grid(Texture atlas, int cell_w, int cell_h, int first = 32) returns Font
+        var font = Font(atlas, double(cell_h), double(cell_h))
+        var columns = math.max(atlas.width // cell_w, 1)
+        var count = columns * math.max(atlas.height // cell_h, 1)
+        for i in 0..<count do
+            if first + i <= 255 do
+                font.glyph(first + i, atlas.cell(i, cell_w, cell_h), Vec2(0, 0), double(cell_w))
+            end
+        end
+        return font
+    end
+end
+
+# Draws text with its top left corner at (x, y), `size` pixels tall. "\n" starts a new line.
+function text(string content, double x, double y, double size = 16, Color color = WHITE,
+        Font? font = null)
+    nat.ap_text(font_id(font), content, x, y, size, color.r, color.g, color.b, color.a)
+end
+# Draws text centered on a point.
+function text_centered(string content, double x, double y, double size = 16,
+        Color color = WHITE, Font? font = null)
+    var id = font_id(font)
+    nat.ap_text(id, content, x - nat.ap_text_width(id, content, size) / 2,
+        y - nat.ap_text_height(id, content, size) / 2, size, color.r, color.g, color.b,
+        color.a)
+end
+# The width and height the text takes at a size.
+function measure(string content, double size = 16, Font? font = null) returns Vec2
+    var id = font_id(font)
+    return Vec2(nat.ap_text_width(id, content, size), nat.ap_text_height(id, content, size))
+end
+private function font_id(Font? font) returns int
+    if font != null do
+        return font.id
+    end
+    return 0
+end
+
+# --- Drawing in 3D ---------------------------------------------------------------------------
+
+# A view of a 3D world. A positive `fov` (the vertical angle in degrees) gives perspective;
+# zero or less gives a flat (orthographic) view `-fov` units tall.
+struct Camera3D
+    Vec3 position
+    Vec3 target
+    Vec3 up = Vec3(0, 1, 0)
+    double fov = 60
+    double near = 0.05
+    double far = 1000
+
+    # The direction the camera looks in.
+    function forward() returns Vec3
+        return (this.target - this.position).normalized()
+    end
+    function right() returns Vec3
+        return this.forward().cross(this.up).normalized()
+    end
+end
+# Draw in 3D through a camera until end_3d(). Depth is tested, and 2D drawing (the HUD)
+# continues after end_3d().
+function begin_3d(Camera3D camera)
+    nat.ap_begin3d(camera.position.x, camera.position.y, camera.position.z, camera.target.x,
+        camera.target.y, camera.target.z, camera.up.x, camera.up.y, camera.up.z,
+        camera.fov, camera.near, camera.far)
+end
+function end_3d()
+    nat.ap_end3d()
+end
+# A camera circling a point: `yaw` and `pitch` in degrees, `distance` away from it.
+function orbit(Vec3 target, double yaw, double pitch, double distance) returns Camera3D
+    var p = math.clamp(pitch, -89.0, 89.0) * math.PI / 180
+    var y = yaw * math.PI / 180
+    var offset = Vec3(math.cos(p) * math.sin(y), math.sin(p), math.cos(p) * math.cos(y)) * distance
+    return Camera3D(target + offset, target)
+end
+# A first-person camera at a position looking along `yaw` (0 looks down -z) and `pitch`.
+function look(Vec3 position, double yaw, double pitch) returns Camera3D
+    var p = math.clamp(pitch, -89.0, 89.0) * math.PI / 180
+    var y = yaw * math.PI / 180
+    var direction = Vec3(math.sin(y) * math.cos(p), math.sin(p), -math.cos(y) * math.cos(p))
+    return Camera3D(position, position + direction)
+end
+
+# Triangles on the graphics card. Freed when no longer referenced, or by close().
+class Mesh
+    readonly int id
+    private int session = 0
+
+    constructor(int id)
+        this.id = id
+        this.session = nat.ap_session()
+    end
+    destructor
+        this.free()
+    end
+    function free()
+        if this.session != 0 and this.session == nat.ap_session() do
+            nat.ap_mesh_free(this.id)
+        end
+        this.session = 0
+    end
+    function triangles() returns int
+        return nat.ap_mesh_triangles(this.id)
+    end
+    # The distance from the mesh's origin to its farthest vertex.
+    function radius() returns double
+        return nat.ap_mesh_radius(this.id)
+    end
+end
+# Shapes centered on the origin.
+function cube(double width = 1, double height = 1, double depth = 1) returns Mesh
+    return Mesh(nat.ap_mesh_cube(width, height, depth))
+end
+function sphere(double radius = 0.5, int rings = 16, int slices = 24) returns Mesh
+    return Mesh(nat.ap_mesh_sphere(radius, rings, slices))
+end
+# A flat rectangle on the ground; a repeating texture covers it `tiles` times each way.
+function plane(double width = 1, double depth = 1, double tiles = 1) returns Mesh
+    return Mesh(nat.ap_mesh_plane(width, depth, tiles))
+end
+function cylinder(double radius = 0.5, double height = 1, int slices = 24) returns Mesh
+    return Mesh(nat.ap_mesh_cylinder(radius, radius, height, slices))
+end
+function cone(double radius = 0.5, double height = 1, int slices = 24) returns Mesh
+    return Mesh(nat.ap_mesh_cylinder(radius, 0, height, slices))
+end
+# A ring: `radius` to the middle of the tube, `tube` the tube's own radius.
+function torus(double radius = 0.5, double tube = 0.2, int rings = 32, int sides = 16) returns Mesh
+    return Mesh(nat.ap_mesh_torus(radius, tube, rings, sides))
+end
+# Loads a Wavefront OBJ model.
+function load_mesh(string path) returns Mesh
+    return Mesh(nat.ap_mesh_load(path))
+end
+
+# Builds a mesh from vertices and triangles.
+#
+#     var builder = aperture.MeshBuilder()
+#     var a = builder.vertex(Vec3(0, 0, 0), Vec3(0, 1, 0))
+#     ...
+#     builder.triangle(a, b, c)
+#     var mesh = builder.build()
+class MeshBuilder
+    private bool smooth_normals = false
+
+    constructor
+        nat.ap_mesh_begin()
+    end
+    # The color of the vertices added from here on.
+    function color(Color color)
+        nat.ap_mesh_color(color.r, color.g, color.b, color.a)
+    end
+    # Adds a vertex and returns its index. `uv` is its place in a texture, 0 to 1.
+    function vertex(Vec3 position, Vec3 normal = Vec3(0, 1, 0), Vec2 uv = Vec2(0, 0)) returns int
+        return nat.ap_mesh_vertex(position.x, position.y, position.z, normal.x, normal.y,
+            normal.z, uv.x, uv.y)
+    end
+    # A triangle of three vertices, counterclockwise when seen from its front.
+    function triangle(int a, int b, int c)
+        nat.ap_mesh_triangle(a, b, c)
+    end
+    # A four-cornered face, counterclockwise when seen from its front.
+    function quad(int a, int b, int c, int d)
+        nat.ap_mesh_triangle(a, b, c)
+        nat.ap_mesh_triangle(a, c, d)
+    end
+    # Computes every normal from the triangles around its vertex.
+    function smooth()
+        this.smooth_normals = true
+    end
+    function build() returns Mesh
+        if this.smooth_normals do
+            nat.ap_mesh_smooth()
+        end
+        return Mesh(nat.ap_mesh_end())
+    end
+end
+
+# Draws a mesh at a position. `rotation` is degrees around x, y, and z; `size` scales it.
+function draw(Mesh mesh, Vec3 position, Color tint = WHITE, Vec3 rotation = Vec3(0, 0, 0),
+        Vec3 size = Vec3(1, 1, 1), Texture? texture = null)
+    var image = 0
+    if texture != null do
+        image = texture.id
+    end
+    nat.ap_mesh_draw(mesh.id, image, position.x, position.y, position.z, rotation.x, rotation.y,
+        rotation.z, size.x, size.y, size.z, tint.r, tint.g, tint.b, tint.a)
+end
+# Transforms apply to everything drawn in 3D until the matching pop_3d().
+function push_3d()
+    nat.ap_push3d()
+end
+function pop_3d()
+    nat.ap_pop3d()
+end
+function translate_3d(Vec3 by)
+    nat.ap_translate3d(by.x, by.y, by.z)
+end
+function rotate_3d(double degrees, Vec3 axis)
+    nat.ap_rotate3d(degrees, axis.x, axis.y, axis.z)
+end
+function scale_3d(Vec3 by)
+    nat.ap_scale3d(by.x, by.y, by.z)
+end
+# Light that reaches everything.
+function ambient(Color color)
+    nat.ap_ambient(color.r, color.g, color.b)
+end
+# The directional light: the direction it shines in, and its color.
+function sun(Vec3 direction, Color color = WHITE)
+    nat.ap_sun(direction.x, direction.y, direction.z, color.r, color.g, color.b)
+end
+# Point light `index` (0 to 7) at a position, fading out at `range`.
+function light(int index, Vec3 position, Color color = WHITE, double range = 10)
+    nat.ap_light(index, position.x, position.y, position.z, color.r, color.g, color.b, range)
+end
+function light_off(int index)
+    nat.ap_light(index, 0, 0, 0, 0, 0, 0, 0)
+end
+# Whether meshes are shaded by the lights (on by default).
+function lighting(bool on)
+    nat.ap_lighting(on)
+end
+# Highlights: `strength` 0 (matte) to 1, `tightness` higher for smaller highlights.
+function shine(double strength, double tightness = 32)
+    nat.ap_shine(strength, tightness)
+end
+# Fades distant things into a color between two distances.
+function fog(Color color, double start, double finish)
+    nat.ap_fog(color.r, color.g, color.b, start, finish)
+end
+function no_fog()
+    nat.ap_fog(0, 0, 0, 0, 0)
+end
+function wireframe(bool on)
+    nat.ap_wireframe(on)
+end
+# Whether faces pointing away from the camera are skipped (on by default).
+function cull(bool on)
+    nat.ap_cull(on)
+end
+# Whether drawing hides what is drawn behind it later; turn off for transparent things, drawn
+# last.
+function depth_write(bool on)
+    nat.ap_depth_write(on)
+end
+function line_3d(Vec3 from, Vec3 to, Color color = WHITE)
+    nat.ap_line3d(from.x, from.y, from.z, to.x, to.y, to.z, color.r, color.g, color.b, color.a)
+end
+# A square grid of lines on the ground, centered on the origin.
+function grid(int cells = 10, double spacing = 1, Color color = GRAY)
+    nat.ap_grid(cells, spacing, color.r, color.g, color.b, color.a)
+end
+# The outline of a box between two corners.
+function box_lines(Vec3 low, Vec3 high, Color color = WHITE)
+    for i in 0..<4 do
+        var x = low.x if i % 2 == 0 else high.x
+        var z = low.z if i < 2 else high.z
+        line_3d(Vec3(x, low.y, z), Vec3(x, high.y, z), color)
+    end
+    for y in [low.y, high.y] do
+        line_3d(Vec3(low.x, y, low.z), Vec3(high.x, y, low.z), color)
+        line_3d(Vec3(high.x, y, low.z), Vec3(high.x, y, high.z), color)
+        line_3d(Vec3(high.x, y, high.z), Vec3(low.x, y, high.z), color)
+        line_3d(Vec3(low.x, y, high.z), Vec3(low.x, y, low.z), color)
+    end
+end
+# A texture that always faces the camera: trees, particles, labels.
+function billboard(Texture texture, Vec3 position, double height = 1, Color tint = WHITE)
+    var width = height * double(texture.width) / double(texture.height)
+    nat.ap_billboard(texture.id, 0, 0, double(texture.width), double(texture.height), position.x,
+        position.y, position.z, width, height, tint.r, tint.g, tint.b, tint.a)
+end
+# Where a point in space appears on screen (for the camera of the last begin_3d).
+function project(Vec3 point) returns Vec2
+    nat.ap_project(point.x, point.y, point.z)
+    return Vec2(nat.ap_result(0), nat.ap_result(1))
+end
+# Whether a point in space is in front of the camera and within its range.
+function visible(Vec3 point) returns bool
+    nat.ap_project(point.x, point.y, point.z)
+    var depth = nat.ap_result(2)
+    return depth >= 0 and depth <= 1
+end
+
+# A half-line in space.
+struct Ray
+    Vec3 origin
+    Vec3 direction
+
+    function at(double distance) returns Vec3
+        return this.origin + this.direction * distance
+    end
+    # The distance along the ray to a sphere, or -1 when it misses.
+    function hits_sphere(Vec3 center, double radius) returns double
+        var to_center = center - this.origin
+        var along = to_center.dot(this.direction)
+        var closest = to_center.length_squared() - along * along
+        if closest > radius * radius do
+            return -1
+        end
+        var half = math.sqrt(radius * radius - closest)
+        if along - half >= 0 do
+            return along - half
+        end
+        if along + half >= 0 do
+            return along + half
+        end
+        return -1
+    end
+    # The distance along the ray to a box between two corners, or -1 when it misses.
+    function hits_box(Vec3 low, Vec3 high) returns double
+        var near = -math.INF
+        var far = math.INF
+        var origin = [this.origin.x, this.origin.y, this.origin.z]
+        var direction = [this.direction.x, this.direction.y, this.direction.z]
+        var lows = [low.x, low.y, low.z]
+        var highs = [high.x, high.y, high.z]
+        for i in 0..<3 do
+            if math.abs(direction[i]) < 0.000000001 do
+                if origin[i] < lows[i] or origin[i] > highs[i] do
+                    return -1
+                end
+            else do
+                var a = (lows[i] - origin[i]) / direction[i]
+                var b = (highs[i] - origin[i]) / direction[i]
+                near = math.max(near, math.min(a, b))
+                far = math.min(far, math.max(a, b))
+            end
+        end
+        if near > far or far < 0 do
+            return -1
+        end
+        return near if near >= 0 else far
+    end
+    # The distance along the ray to a plane through `point` facing `normal`, or -1.
+    function hits_plane(Vec3 point, Vec3 normal) returns double
+        var facing = this.direction.dot(normal)
+        if math.abs(facing) < 0.000000001 do
+            return -1
+        end
+        var distance = (point - this.origin).dot(normal) / facing
+        return distance if distance >= 0 else -1
+    end
+end
+# The ray from the camera through a screen position (for picking with the mouse).
+function screen_ray(Vec2 screen) returns Ray
+    nat.ap_screen_ray(screen.x, screen.y)
+    return Ray(Vec3(nat.ap_result(0), nat.ap_result(1), nat.ap_result(2)),
+        Vec3(nat.ap_result(3), nat.ap_result(4), nat.ap_result(5)))
+end
+
+# --- Sound -----------------------------------------------------------------------------------
+
+const int WAVE_SINE = 0
+const int WAVE_SQUARE = 1
+const int WAVE_SAW = 2
+const int WAVE_TRIANGLE = 3
+const int WAVE_NOISE = 4
+
+# A sound in memory. play() returns a voice number for stop(), set_volume(), and playing().
+class Sound
+    readonly int id
+    private int session = 0
+
+    constructor(int id)
+        this.id = id
+        this.session = nat.ap_session()
+    end
+    destructor
+        this.free()
+    end
+    function free()
+        if this.session != 0 and this.session == nat.ap_session() do
+            nat.ap_sound_free(this.id)
+        end
+        this.session = 0
+    end
+    function seconds() returns double
+        return nat.ap_sound_seconds(this.id)
+    end
+    # Plays the sound. `pitch` 1 is as recorded; 2 is an octave higher.
+    function play(double volume = 1, double pitch = 1) returns int
+        return nat.ap_sound_play(this.id, volume, pitch, false)
+    end
+    # Plays the sound over and over (music, engines) until its voice is stopped.
+    function loop(double volume = 1, double pitch = 1) returns int
+        return nat.ap_sound_play(this.id, volume, pitch, true)
+    end
+end
+# Loads a WAV file.
+function load_sound(string path) returns Sound
+    return Sound(nat.ap_sound_load(path))
+end
+# A synthesized sound: a wave at `frequency` Hz for `seconds`, sliding to `slide_to` Hz (0
+# keeps the pitch) while fading out. Good for effects without sound files.
+function tone(int wave, double frequency, double seconds, double slide_to = 0,
+        double volume = 0.5) returns Sound
+    return Sound(nat.ap_sound_tone(wave, frequency, slide_to if slide_to > 0 else frequency,
+        seconds, volume))
+end
+function stop(int voice)
+    nat.ap_voice_stop(voice)
+end
+function stop_all()
+    nat.ap_stop_all()
+end
+function playing(int voice) returns bool
+    return nat.ap_voice_playing(voice)
+end
+function set_volume(int voice, double volume)
+    nat.ap_voice_volume(voice, volume)
+end
+function set_pitch(int voice, double pitch)
+    nat.ap_voice_pitch(voice, pitch)
+end
+function pause(int voice, bool paused = true)
+    nat.ap_voice_pause(voice, paused)
+end
+# The volume of everything, 0 to 1 (applies to sounds played afterwards).
+function master_volume(double volume)
+    nat.ap_master_volume(volume)
+end
+# Whether there is an audio device (play() is silent without one).
+function has_audio() returns bool
+    return nat.ap_audio_available()
+end
+
+# --- Helpers ---------------------------------------------------------------------------------
+
+function lerp(double from, double to, double t) returns double
+    return from + (to - from) * t
+end
+# At most `step` closer to `to`.
+function approach(double from, double to, double step) returns double
+    if math.abs(to - from) <= step do
+        return to
+    end
+    return from + step if to > from else from - step
+end
+# `value` moved from one range to another: remap(5, 0, 10, 0, 100) is 50.
+function remap(double value, double from_low, double from_high, double to_low,
+        double to_high) returns double
+    return to_low + (value - from_low) / (from_high - from_low) * (to_high - to_low)
+end
+# 0 to 1 with a slow start and end.
+function smooth(double t) returns double
+    var x = math.clamp(t, 0.0, 1.0)
+    return x * x * (3 - 2 * x)
+end
+function ease_in(double t) returns double
+    var x = math.clamp(t, 0.0, 1.0)
+    return x * x * x
+end
+function ease_out(double t) returns double
+    var x = 1 - math.clamp(t, 0.0, 1.0)
+    return 1 - x * x * x
+end
+# A value swinging between 0 and 1, `period` seconds per cycle.
+function pulse(double period = 1) returns double
+    return math.sin(nat.ap_time() / period * math.TAU) * 0.5 + 0.5
+end
+# A random double from `low` up to `high`.
+function random(double low = 0, double high = 1) returns double
+    return low + math.random() * (high - low)
+end
+# True `probability` of the time (0 to 1).
+function chance(double probability) returns bool
+    return math.random() < probability
+end
+# A random point inside a rectangle.
+function random_in(Rect area) returns Vec2
+    return Vec2(area.x + math.random() * area.w, area.y + math.random() * area.h)
+end
+# A random direction of length 1.
+function random_direction() returns Vec2
+    return Vec2.from_angle(math.random() * 360)
+end
+function circles_overlap(Vec2 a, double radius_a, Vec2 b, double radius_b) returns bool
+    var reach = radius_a + radius_b
+    return (a - b).length_squared() < reach * reach
+end
+function circle_overlaps_rect(Vec2 center, double radius, Rect area) returns bool
+    var nearest = Vec2(math.clamp(center.x, area.x, area.x + area.w),
+        math.clamp(center.y, area.y, area.y + area.h))
+    return (center - nearest).length_squared() < radius * radius
+end
+# Whether two boxes in space overlap, each given by its low and high corners.
+function boxes_overlap(Vec3 low_a, Vec3 high_a, Vec3 low_b, Vec3 high_b) returns bool
+    return low_a.x < high_b.x and low_b.x < high_a.x and low_a.y < high_b.y and
+        low_b.y < high_a.y and low_a.z < high_b.z and low_b.z < high_a.z
+end
+function spheres_overlap(Vec3 a, double radius_a, Vec3 b, double radius_b) returns bool
+    var reach = radius_a + radius_b
+    return (a - b).length_squared() < reach * reach
+end
+
+# Counts time for things that happen every so often or after a delay.
+#
+#     var spawn = aperture.Timer(1.5)
+#     if spawn.tick() do ... end        # true once every 1.5 seconds
+class Timer
+    double interval
+    double elapsed = 0
+
+    # Advances by the frame's time; true each time the interval passes.
+    function tick() returns bool
+        this.elapsed += nat.ap_delta()
+        if this.elapsed >= this.interval do
+            this.elapsed -= this.interval
+            return true
+        end
+        return false
+    end
+    # How far through the interval, 0 to 1.
+    function progress() returns double
+        return math.clamp(this.elapsed / this.interval, 0.0, 1.0)
+    end
+    function reset()
+        this.elapsed = 0
+    end
+end
+
+# Frames of a sprite sheet played in order.
+#
+#     var run = aperture.Animation(sheet, 32, 32, [0, 1, 2, 3], 10)
+#     run.update()
+#     run.draw(Vec2(100, 100))
+class Animation
+    Texture sheet
+    int cell_w
+    int cell_h
+    int[] frames
+    double rate = 10
+    bool looping = true
+    double clock = 0
+
+    # Advances by the frame's time.
+    function update()
+        this.clock += nat.ap_delta() * this.rate
+    end
+    function restart()
+        this.clock = 0
+    end
+    # Whether a non-looping animation reached its last frame.
+    function finished() returns bool
+        return not this.looping and int(this.clock) >= this.frames.length
+    end
+    # The sheet cell showing now.
+    function current() returns int
+        var index = int(this.clock)
+        if this.looping do
+            index = index % this.frames.length
+        else do
+            index = math.min(index, this.frames.length - 1)
+        end
+        return this.frames[index]
+    end
+    # Draws the current frame centered on a point; `flip` mirrors it left to right.
+    function draw(Vec2 position, double scale = 1, bool flip = false, double rotation = 0,
+            Color tint = WHITE)
+        var source = this.sheet.cell(this.current(), this.cell_w, this.cell_h)
+        if flip do
+            source = Rect(source.x + source.w, source.y, -source.w, source.h)
+        end
+        var w = double(this.cell_w) * scale
+        var h = double(this.cell_h) * scale
+        sprite_part(this.sheet, source, Rect(position.x, position.y, w, h), Vec2(w / 2, h / 2),
+            rotation, tint)
+    end
+end
+
+# A grid of tiles drawn from a tile sheet. Tile 0 is empty; tile n is cell n - 1 of the sheet.
+class Tilemap
+    int columns
+    int rows
+    double tile_size
+    int[] tiles = []
+
+    constructor(int columns, int rows, double tile_size)
+        this.columns = columns
+        this.rows = rows
+        this.tile_size = tile_size
+        this.tiles = []
+        for i in 0..<columns * rows do
+            this.tiles.push(0)
+        end
+    end
+    function inside(int column, int row) returns bool
+        return column >= 0 and row >= 0 and column < this.columns and row < this.rows
+    end
+    # The tile at a cell (0 outside the map).
+    function get(int column, int row) returns int
+        if not this.inside(column, row) do
+            return 0
+        end
+        return this.tiles[row * this.columns + column]
+    end
+    function set(int column, int row, int tile)
+        if this.inside(column, row) do
+            this.tiles[row * this.columns + column] = tile
+        end
+    end
+    # The tile under a world position.
+    function at(Vec2 position) returns int
+        return this.get(int(math.floor(position.x / this.tile_size)),
+            int(math.floor(position.y / this.tile_size)))
+    end
+    # The world rectangle of a cell.
+    function cell(int column, int row) returns Rect
+        return Rect(double(column) * this.tile_size, double(row) * this.tile_size, this.tile_size,
+            this.tile_size)
+    end
+    # Whether a rectangle touches any tile that is not empty.
+    function blocked(Rect area) returns bool
+        var left = int(math.floor(area.x / this.tile_size))
+        var right = int(math.floor((area.x + area.w - 0.0001) / this.tile_size))
+        var top = int(math.floor(area.y / this.tile_size))
+        var bottom = int(math.floor((area.y + area.h - 0.0001) / this.tile_size))
+        for row in top..bottom do
+            for column in left..right do
+                if this.get(column, row) != 0 do
+                    return true
+                end
+            end
+        end
+        return false
+    end
+    # Moves a rectangle by `motion`, stopping at tiles: first across, then down, so it slides
+    # along walls. Returns where it ends up.
+    function slide(Rect body, Vec2 motion) returns Rect
+        var moved = body
+        var across = Rect(moved.x + motion.x, moved.y, moved.w, moved.h)
+        if not this.blocked(across) do
+            moved = across
+        end
+        var down = Rect(moved.x, moved.y + motion.y, moved.w, moved.h)
+        if not this.blocked(down) do
+            moved = down
+        end
+        return moved
+    end
+    # Draws the tiles from a sheet whose cells are `cell_size` pixels square.
+    function draw(Texture sheet, int cell_size)
+        for row in 0..<this.rows do
+            for column in 0..<this.columns do
+                var tile = this.tiles[row * this.columns + column]
+                if tile != 0 do
+                    sprite_part(sheet, sheet.cell(tile - 1, cell_size, cell_size),
+                        this.cell(column, row))
+                end
+            end
+        end
+    end
+    # Draws each tile as a plain square: `colors[n - 1]` for tile n.
+    function draw_colors(Color[] colors)
+        for row in 0..<this.rows do
+            for column in 0..<this.columns do
+                var tile = this.tiles[row * this.columns + column]
+                if tile != 0 and tile <= colors.length do
+                    fill(this.cell(column, row), colors[tile - 1])
+                end
+            end
+        end
+    end
+end
+
+# One particle of a Particles emitter.
+struct Particle
+    Vec2 position
+    Vec2 velocity
+    double age = 0
+    double life = 1
+    double size = 4
+end
+
+# Short-lived specks: sparks, smoke, dust.
+#
+#     var sparks = aperture.Particles()
+#     sparks.burst(position, 24)
+#     sparks.update()
+#     sparks.draw()
+class Particles
+    Particle[] items = []
+    Color start = YELLOW
+    Color finish = Color(255, 60, 20, 0)
+    double speed = 160
+    double life = 0.7
+    double size = 5
+    Vec2 gravity = Vec2(0, 0)
+    int limit = 2000
+
+    # Emits `count` particles from a point in every direction, or within `spread` degrees
+    # of `direction`.
+    function burst(Vec2 position, int count, double direction = 0, double spread = 360)
+        for i in 0..<count do
+            if this.items.length >= this.limit do
+                return
+            end
+            var angle = direction + (math.random() - 0.5) * spread
+            var velocity = Vec2.from_angle(angle) * (this.speed * (0.4 + math.random() * 0.6))
+            this.items.push(Particle(position, velocity, 0, this.life * (0.5 + math.random() * 0.5),
+                this.size * (0.6 + math.random() * 0.4)))
+        end
+    end
+    # Moves the particles by the frame's time and drops the ones that ran out.
+    function update()
+        var dt = nat.ap_delta()
+        Particle[] alive = []
+        for item in this.items do
+            var age = item.age + dt
+            if age < item.life do
+                var velocity = item.velocity + this.gravity * dt
+                alive.push(Particle(item.position + velocity * dt, velocity, age, item.life,
+                    item.size))
+            end
+        end
+        this.items = alive
+    end
+    function draw()
+        for item in this.items do
+            var t = item.age / item.life
+            var side = item.size * (1 - t * 0.5)
+            var color = this.start.lerp(this.finish, t)
+            nat.ap_rect(item.position.x - side / 2, item.position.y - side / 2, side, side,
+                color.r, color.g, color.b, color.a)
+        end
+    end
+    function count() returns int
+        return this.items.length
+    end
+end

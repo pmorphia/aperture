@@ -1,0 +1,11 @@
+[package]
+name = "aperture"
+author = "polymorphia"
+version = "1.0.0"
+description = "2D and 3D games in Flywheel: window, input, sprites, text, meshes, lights, sound"
+main = "aperture.fw"
+license = "MIT"
+exclude = ["tests/*", "tools/*", ".gitignore", "shots/*"]
+
+[scripts]
+test = "flywheel test tests/"

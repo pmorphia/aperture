@@ -1,0 +1,18 @@
+# The smallest Aperture program: a window, a shape you can move, and text.
+#
+#     flywheel run examples/hello.fw
+import "../aperture.fw" as ap
+
+ap.open("Hello, Aperture", 800, 450)
+var position = ap.center()
+while ap.frame() do
+    position = position + ap.steer() * (240 * ap.delta())
+    ap.clear(ap.NAVY)
+    ap.circle(position.x, position.y, 24 + 6 * ap.pulse(), ap.ORANGE)
+    ap.text("Arrow keys or WASD move the circle. Escape quits.", 20, 20, 16)
+    ap.text("{int(ap.fps())} fps", 20, 420, 16, ap.GRAY)
+    if ap.key_pressed(ap.KEY_ESCAPE) do
+        ap.quit()
+    end
+end
+ap.close()

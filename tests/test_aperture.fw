@@ -1,0 +1,646 @@
+# flywheel test tests/
+#
+# Runs without a visible window. On a machine with no display, set SDL_VIDEODRIVER=offscreen
+# (and SDL_AUDIODRIVER=dummy when there is no sound card).
+import "../aperture.fw" as ap
+import fs
+import math
+import testing
+
+private function close_to(double actual, double expected, double tolerance = 0.0001) returns bool
+    return math.abs(actual - expected) <= tolerance
+end
+
+# Every test draws into a 200x120 canvas, where reading pixels back is exact.
+ap.Canvas? stage = null
+
+function setup_all
+    ap.open("aperture tests", 320, 200, ap.HIDDEN + ap.NO_VSYNC)
+    stage = ap.Canvas(200, 120)
+end
+function teardown_all
+    stage = null
+    ap.close()
+end
+function setup
+    ap.frame()
+    var canvas = stage
+    if canvas != null do
+        ap.draw_to(canvas)
+    end
+    ap.clear(ap.BLACK)
+end
+private function pixel(double x, double y) returns int
+    return ap.read_pixel(x, y)
+end
+
+function test_vectors
+    var a = ap.Vec2(3, 4)
+    testing.assert_equal(a.length(), 5.0)
+    testing.assert_equal((a + ap.Vec2(1, 1)).x, 4.0)
+    testing.assert_equal((a - ap.Vec2(1, 1)).y, 3.0)
+    testing.assert_equal((a * 2).y, 8.0)
+    testing.assert_equal((2 * a).x, 6.0)
+    testing.assert_equal((a / 2).x, 1.5)
+    testing.assert_equal((-a).x, -3.0)
+    testing.assert(a == ap.Vec2(3, 4))
+    testing.assert(close_to(a.normalized().length(), 1))
+    testing.assert_equal(ap.Vec2(0, 0).normalized().x, 0.0)
+    testing.assert_equal(a.dot(ap.Vec2(1, 2)), 11.0)
+    testing.assert_equal(ap.Vec2(1, 0).cross(ap.Vec2(0, 1)), 1.0)
+    testing.assert_equal(a.distance(ap.Vec2(0, 0)), 5.0)
+    testing.assert(close_to(ap.Vec2(0, 1).angle(), 90))
+    var turned = ap.Vec2(1, 0).rotated(90)
+    testing.assert(close_to(turned.x, 0) and close_to(turned.y, 1))
+    testing.assert_equal(a.lerp(ap.Vec2(5, 8), 0.5).y, 6.0)
+    testing.assert_equal(ap.Vec2(0, 0).toward(ap.Vec2(10, 0), 3).x, 3.0)
+    testing.assert_equal(ap.Vec2(0, 0).toward(ap.Vec2(1, 0), 3).x, 1.0)
+    testing.assert(close_to(ap.Vec2(30, 40).limited(5).length(), 5))
+    testing.assert(close_to(ap.Vec2.from_angle(180).x, -1))
+    testing.assert_equal(a.scaled(ap.Vec2(2, 3)).y, 12.0)
+
+    var p = ap.Vec3(1, 2, 2)
+    testing.assert_equal(p.length(), 3.0)
+    testing.assert_equal((p + ap.Vec3(1, 1, 1)).z, 3.0)
+    testing.assert_equal((p * 2).y, 4.0)
+    testing.assert_equal(p.dot(ap.Vec3(1, 1, 1)), 5.0)
+    var up = ap.Vec3(1, 0, 0).cross(ap.Vec3(0, 1, 0))
+    testing.assert(up == ap.Vec3(0, 0, 1))
+    testing.assert(close_to(p.normalized().length(), 1))
+    testing.assert_equal(p.lerp(ap.Vec3(3, 2, 2), 0.5).x, 2.0)
+end
+
+function test_colors
+    testing.assert(ap.hex("#ff8000") == ap.Color(255, 128, 0, 255))
+    testing.assert(ap.hex("0f0") == ap.Color(0, 255, 0, 255))
+    testing.assert(ap.hex("#11223344") == ap.Color(17, 34, 51, 68))
+    testing.expect_error(ValueError, function() => ap.hex("#12"))
+    testing.expect_error(ValueError, function() => ap.hex("#zzzzzz"))
+    testing.assert(ap.hsv(0, 1, 1) == ap.Color(255, 0, 0, 255))
+    testing.assert(ap.hsv(120, 1, 1) == ap.Color(0, 255, 0, 255))
+    testing.assert(ap.hsv(240, 1, 0.5) == ap.Color(0, 0, 128, 255))
+    testing.assert_equal(ap.WHITE.fade(0.5).a, 128)
+    testing.assert(ap.BLACK.lerp(ap.WHITE, 0.5) == ap.Color(128, 128, 128, 255))
+    testing.assert(ap.Color(100, 100, 100).brightness(2) == ap.Color(200, 200, 200, 255))
+    testing.assert_equal(ap.Color(1, 2, 3, 4).packed(), 16909060)
+end
+
+function test_rectangles
+    var r = ap.Rect(10, 20, 30, 40)
+    testing.assert_equal(r.right(), 40.0)
+    testing.assert_equal(r.bottom(), 60.0)
+    testing.assert(r.center() == ap.Vec2(25, 40))
+    testing.assert(r.contains(ap.Vec2(10, 20)) and not r.contains(ap.Vec2(40, 20)))
+    testing.assert(r.overlaps(ap.Rect(35, 55, 10, 10)))
+    testing.assert(not r.overlaps(ap.Rect(40, 20, 5, 5)))
+    testing.assert(r.intersection(ap.Rect(30, 50, 100, 100)) == ap.Rect(30, 50, 10, 10))
+    testing.assert_equal(r.intersection(ap.Rect(100, 100, 5, 5)).w, 0.0)
+    testing.assert(r.moved(ap.Vec2(1, 2)) == ap.Rect(11, 22, 30, 40))
+    testing.assert(r.grown(5) == ap.Rect(5, 15, 40, 50))
+    testing.assert(ap.Rect.centered(ap.Vec2(50, 50), 20, 10) == ap.Rect(40, 45, 20, 10))
+    testing.assert(ap.circles_overlap(ap.Vec2(0, 0), 5, ap.Vec2(8, 0), 4))
+    testing.assert(not ap.circles_overlap(ap.Vec2(0, 0), 5, ap.Vec2(10, 0), 4))
+    testing.assert(ap.circle_overlaps_rect(ap.Vec2(0, 25), 11, r))
+    testing.assert(not ap.circle_overlaps_rect(ap.Vec2(0, 25), 9, r))
+end
+
+function test_shapes
+    ap.rect(10, 10, 20, 20, ap.RED)
+    testing.assert_equal(pixel(15, 15), ap.RED.packed())
+    testing.assert_equal(pixel(35, 15), ap.BLACK.packed())
+    ap.fill(ap.Rect(40, 10, 10, 10), ap.GREEN)
+    testing.assert_equal(pixel(45, 15), ap.GREEN.packed())
+    ap.rect_lines(60, 10, 20, 20, 2, ap.BLUE)
+    testing.assert_equal(pixel(61, 20), ap.BLUE.packed())
+    testing.assert_equal(pixel(70, 20), ap.BLACK.packed())
+    ap.outline(ap.Rect(60, 40, 20, 20), 2, ap.CYAN)
+    testing.assert_equal(pixel(79, 50), ap.CYAN.packed())
+    ap.circle(110, 30, 15, ap.YELLOW)
+    testing.assert_equal(pixel(110, 30), ap.YELLOW.packed())
+    testing.assert_equal(pixel(110, 50), ap.BLACK.packed())
+    ap.circle_lines(150, 30, 15, 4, ap.PINK)
+    testing.assert_equal(pixel(150, 16), ap.PINK.packed())
+    testing.assert_equal(pixel(150, 30), ap.BLACK.packed())
+    ap.ellipse(30, 70, 20, 8, ap.ORANGE)
+    testing.assert_equal(pixel(45, 70), ap.ORANGE.packed())
+    testing.assert_equal(pixel(30, 82), ap.BLACK.packed())
+    ap.line(100, 70, 140, 70, 4, ap.WHITE)
+    testing.assert_equal(pixel(120, 70), ap.WHITE.packed())
+    ap.segment(ap.Vec2(100, 90), ap.Vec2(140, 90), 4, ap.LIME)
+    testing.assert_equal(pixel(120, 90), ap.LIME.packed())
+    ap.triangle(ap.Vec2(160, 60), ap.Vec2(190, 60), ap.Vec2(160, 90), ap.PURPLE)
+    testing.assert_equal(pixel(165, 65), ap.PURPLE.packed())
+    testing.assert_equal(pixel(188, 88), ap.BLACK.packed())
+    ap.polygon([ap.Vec2(10, 95), ap.Vec2(40, 95), ap.Vec2(40, 115), ap.Vec2(10, 115)], ap.BROWN)
+    testing.assert_equal(pixel(25, 105), ap.BROWN.packed())
+    ap.path([ap.Vec2(60, 100), ap.Vec2(90, 100), ap.Vec2(90, 115)], 2, ap.SKY, true)
+    testing.assert_equal(pixel(75, 100), ap.SKY.packed())
+    ap.sector(150, 100, 14, 0, 90, ap.GRAY)
+    testing.assert_equal(pixel(155, 105), ap.GRAY.packed())
+    testing.assert_equal(pixel(145, 95), ap.BLACK.packed())
+    ap.arc(180, 100, 12, 0, 360, 4, ap.RED)
+    testing.assert_equal(pixel(192, 100), ap.RED.packed())
+end
+
+function test_gradients_and_blending
+    ap.gradient(0, 0, 100, 100, ap.BLACK, ap.WHITE)
+    var top = pixel(50, 2)
+    var bottom = pixel(50, 98)
+    testing.assert(top < ap.Color(40, 40, 40).packed())
+    testing.assert(bottom > ap.Color(200, 200, 200).packed())
+    ap.gradient_across(100, 0, 100, 100, ap.RED, ap.BLUE)
+    testing.assert(pixel(102, 50) > pixel(198, 50))
+
+    ap.clear(ap.BLACK)
+    ap.rect(0, 0, 50, 50, ap.Color(100, 0, 0))
+    ap.blend(ap.BLEND_ADD)
+    ap.rect(0, 0, 50, 50, ap.Color(0, 100, 0))
+    ap.blend(ap.BLEND_ALPHA)
+    testing.assert_equal(pixel(25, 25), ap.Color(100, 100, 0).packed())
+    ap.rect(60, 0, 50, 50, ap.WHITE)
+    ap.rect(60, 0, 50, 50, ap.BLACK.fade(0.5))
+    var mixed = pixel(85, 25)
+    testing.assert(mixed > ap.Color(120, 120, 120).packed() and
+        mixed < ap.Color(135, 135, 135).packed())
+    ap.clip(ap.Rect(120, 0, 10, 10))
+    ap.rect(110, 0, 60, 60, ap.GREEN)
+    ap.unclip()
+    testing.assert_equal(pixel(125, 5), ap.GREEN.packed())
+    testing.assert_equal(pixel(140, 5), ap.BLACK.packed())
+    testing.assert_equal(pixel(125, 20), ap.BLACK.packed())
+end
+
+function test_transforms_and_cameras
+    ap.push()
+    ap.translate(100, 50)
+    ap.rotate(90)
+    ap.scale(2, 2)
+    ap.rect(0, 0, 10, 5, ap.RED)
+    ap.pop()
+    # (0..10, 0..5) scaled to (0..20, 0..10), turned a quarter: x in 90..100, y in 50..70.
+    testing.assert_equal(pixel(95, 60), ap.RED.packed())
+    testing.assert_equal(pixel(105, 60), ap.BLACK.packed())
+    ap.rect(0, 0, 4, 4, ap.GREEN)
+    testing.assert_equal(pixel(2, 2), ap.GREEN.packed())
+
+    var camera = ap.Camera2D(ap.Vec2(1000, 1000), ap.Vec2(100, 60), 0, 2)
+    ap.begin_camera(camera)
+    ap.rect(1000, 1000, 10, 10, ap.BLUE)
+    ap.end_camera()
+    testing.assert_equal(pixel(110, 70), ap.BLUE.packed())
+    testing.assert_equal(pixel(125, 70), ap.BLACK.packed())
+    testing.assert(ap.to_screen(camera, ap.Vec2(1010, 1000)) == ap.Vec2(120, 60))
+    var back = ap.to_world(camera, ap.Vec2(120, 60))
+    testing.assert(close_to(back.x, 1010) and close_to(back.y, 1000))
+    var turned = ap.Camera2D(ap.Vec2(0, 0), ap.Vec2(50, 50), 90, 1)
+    var there = ap.to_screen(turned, ap.Vec2(10, 0))
+    testing.assert(close_to(there.x, 50) and close_to(there.y, 60))
+    var again = ap.to_world(turned, there)
+    testing.assert(close_to(again.x, 10) and close_to(again.y, 0))
+    testing.assert(ap.camera_at(ap.Vec2(5, 5)).offset == ap.Vec2(100, 60))
+    testing.assert_equal(ap.width(), 200.0)
+    testing.assert(ap.size() == ap.Vec2(200, 120))
+    testing.assert(ap.window_size() == ap.Vec2(320, 200))
+end
+
+function test_textures
+    var checks = ap.make_texture(4, 4, function(int x, int y) returns ap.Color
+        return ap.WHITE if (x + y) % 2 == 0 else ap.RED
+    end)
+    testing.assert_equal(checks.width, 4)
+    testing.assert(checks.size() == ap.Vec2(4, 4))
+    testing.assert(checks.bounds() == ap.Rect(0, 0, 4, 4))
+    testing.assert(checks.cell(5, 2, 2) == ap.Rect(2, 4, 2, 2))
+    ap.sprite(checks, 10, 10)
+    testing.assert_equal(pixel(10.5, 10.5), ap.WHITE.packed())
+    testing.assert_equal(pixel(11.5, 10.5), ap.RED.packed())
+    # A tint multiplies each channel: green leaves white green and takes RED's red away.
+    ap.sprite(checks, 30, 10, ap.Color(0, 255, 0))
+    testing.assert_equal(pixel(30.5, 10.5), ap.Color(0, 255, 0).packed())
+    testing.assert_equal(pixel(31.5, 10.5), ap.Color(0, ap.RED.g, 0).packed())
+    # One texel stretched to 20x20.
+    ap.sprite_part(checks, ap.Rect(1, 0, 1, 1), ap.Rect(50, 10, 20, 20))
+    testing.assert_equal(pixel(60, 20), ap.RED.packed())
+    # Centered, scaled 10 times: 40 pixels around (120, 40).
+    ap.sprite_at(checks, ap.Vec2(120, 40), 0, 10)
+    testing.assert_equal(pixel(101, 21), ap.WHITE.packed())
+    testing.assert_equal(pixel(111, 21), ap.RED.packed())
+    testing.assert_equal(pixel(99, 21), ap.BLACK.packed())
+    # The origin (here the middle) lands on the target's position, and a half-turn around it
+    # puts the first texel on the right.
+    var halves = ap.make_texture(2, 1, function(int x, int y) returns ap.Color
+        return ap.BLUE if x == 0 else ap.YELLOW
+    end)
+    ap.sprite_part(halves, halves.bounds(), ap.Rect(170, 60, 20, 10), ap.Vec2(10, 5), 180)
+    testing.assert_equal(pixel(175, 60), ap.BLUE.packed())
+    testing.assert_equal(pixel(165, 60), ap.YELLOW.packed())
+    testing.assert_equal(pixel(185, 60), ap.BLACK.packed())
+    # A negative source width mirrors it.
+    ap.sprite_part(halves, ap.Rect(2, 0, -2, 1), ap.Rect(160, 90, 20, 10))
+    testing.assert_equal(pixel(165, 95), ap.YELLOW.packed())
+    testing.assert_equal(pixel(175, 95), ap.BLUE.packed())
+    checks.smooth(true)
+    checks.repeat(true)
+    checks.free()
+    testing.expect_error(NativeError, function() => ap.sprite(checks, 0, 0))
+    testing.expect_error(NativeError, function() => ap.load_texture("no-such-image.png"))
+end
+
+function test_text
+    testing.assert(ap.measure("abcd", 8) == ap.Vec2(24, 8))
+    testing.assert(ap.measure("ab\ncdef", 16) == ap.Vec2(48, 36))
+    ap.text("I", 10, 10, 32, ap.WHITE)
+    # The stem of the I is the third of five columns, four pixels wide at this size.
+    testing.assert_equal(pixel(20, 20), ap.WHITE.packed())
+    testing.assert_equal(pixel(11, 20), ap.BLACK.packed())
+    ap.text_centered("HH", 100, 60, 16, ap.RED)
+    testing.assert_equal(pixel(89, 60), ap.RED.packed())
+    testing.assert_equal(pixel(70, 60), ap.BLACK.packed())
+
+    # A font from a sheet: two 4x4 cells, the first solid ('A'), the second empty ('B').
+    var sheet = ap.make_texture(8, 4, function(int x, int y) returns ap.Color
+        return ap.WHITE if x < 4 else ap.TRANSPARENT
+    end)
+    var font = ap.Font.from_grid(sheet, 4, 4, 65)
+    testing.assert(ap.measure("AB", 8, font) == ap.Vec2(16, 8))
+    ap.text("AB", 150, 10, 8, ap.GREEN, font)
+    testing.assert_equal(pixel(154, 14), ap.GREEN.packed())
+    testing.assert_equal(pixel(162, 14), ap.BLACK.packed())
+end
+
+function test_canvases_and_shaders
+    var small = ap.Canvas(16, 16)
+    ap.draw_to(small)
+    testing.assert_equal(ap.width(), 16.0)
+    ap.clear(ap.BLUE)
+    ap.rect(0, 0, 8, 8, ap.RED)
+    testing.assert_equal(ap.read_pixel(2, 2), ap.RED.packed())
+    var canvas = stage
+    if canvas != null do
+        ap.draw_to(canvas)
+    end
+    # Drawn as a texture, a canvas keeps its top at the top.
+    ap.sprite(small.texture, 20, 20)
+    testing.assert_equal(pixel(22, 22), ap.RED.packed())
+    testing.assert_equal(pixel(22, 32), ap.BLUE.packed())
+
+    # Braces with a space beside them are literal in Flywheel strings.
+    var invert = ap.Shader("uniform float u_amount; vec4 effect(vec4 color, sampler2D image, vec2 uv) { vec4 pixel = texture(image, uv) * color; return vec4(mix(pixel.rgb, 1.0 - pixel.rgb, u_amount), pixel.a); }")
+    invert.set("u_amount", 1)
+    ap.use_shader(invert)
+    ap.rect(60, 20, 10, 10, ap.Color(255, 0, 0))
+    ap.no_shader()
+    testing.assert_equal(pixel(65, 25), ap.Color(0, 255, 255).packed())
+    ap.rect(80, 20, 10, 10, ap.Color(255, 0, 0))
+    testing.assert_equal(pixel(85, 25), ap.Color(255, 0, 0).packed())
+    invert.set_vec2("u_unused", ap.Vec2(1, 2))
+    invert.set_vec3("u_unused", ap.Vec3(1, 2, 3))
+    invert.set_color("u_unused", ap.RED)
+    var error = testing.expect_error(NativeError, function() => ap.Shader("this is not GLSL"))
+    testing.assert(error.message.contains("shader error"))
+end
+
+function test_3d
+    var camera = ap.Camera3D(ap.Vec3(0, 0, 5), ap.Vec3(0, 0, 0))
+    testing.assert(camera.forward() == ap.Vec3(0, 0, -1))
+    testing.assert(camera.right() == ap.Vec3(1, 0, 0))
+    var cube = ap.cube(2, 2, 2)
+    testing.assert_equal(cube.triangles(), 12)
+    testing.assert(close_to(cube.radius(), math.sqrt(3.0)))
+
+    ap.lighting(false)
+    ap.begin_3d(camera)
+    ap.draw(cube, ap.Vec3(0, 0, 0), ap.RED)
+    testing.assert(ap.project(ap.Vec3(0, 0, 0)) == ap.Vec2(100, 60))
+    testing.assert(ap.visible(ap.Vec3(0, 0, 0)))
+    testing.assert(not ap.visible(ap.Vec3(0, 0, 50)))
+    var ray = ap.screen_ray(ap.Vec2(100, 60))
+    testing.assert(close_to(ray.direction.z, -1, 0.001))
+    testing.assert(close_to(ray.hits_sphere(ap.Vec3(0, 0, 0), 1), 3.95, 0.01))
+    ap.end_3d()
+    testing.assert_equal(pixel(100, 60), ap.RED.packed())
+    testing.assert_equal(pixel(5, 5), ap.BLACK.packed())
+
+    # A nearer cube hides a farther one whatever the drawing order.
+    ap.clear(ap.BLACK)
+    ap.begin_3d(camera)
+    ap.draw(cube, ap.Vec3(0, 0, 1), ap.GREEN)
+    ap.draw(cube, ap.Vec3(0, 0, -2), ap.RED)
+    ap.end_3d()
+    testing.assert_equal(pixel(100, 60), ap.GREEN.packed())
+
+    # Lit from the front the face is bright; lit from behind only the ambient light is left.
+    ap.lighting(true)
+    ap.ambient(ap.Color(50, 50, 50))
+    ap.sun(ap.Vec3(0, 0, -1), ap.WHITE)
+    ap.clear(ap.BLACK)
+    ap.begin_3d(camera)
+    ap.draw(cube, ap.Vec3(0, 0, 0), ap.WHITE)
+    ap.end_3d()
+    testing.assert_equal(pixel(100, 60), ap.WHITE.packed())
+    ap.sun(ap.Vec3(0, 0, 1), ap.WHITE)
+    ap.clear(ap.BLACK)
+    ap.begin_3d(camera)
+    ap.draw(cube, ap.Vec3(0, 0, 0), ap.WHITE)
+    ap.end_3d()
+    testing.assert_equal(pixel(100, 60), ap.Color(50, 50, 50).packed())
+    # A point light adds to it and fades with distance.
+    ap.light(0, ap.Vec3(0, 0, 3), ap.RED, 8)
+    ap.clear(ap.BLACK)
+    ap.begin_3d(camera)
+    ap.draw(cube, ap.Vec3(0, 0, 0), ap.WHITE)
+    ap.end_3d()
+    var lit = pixel(100, 60)
+    testing.assert(lit > ap.Color(150, 50, 50).packed() and lit < ap.Color(255, 50, 50).packed())
+    ap.light_off(0)
+    ap.lighting(false)
+
+    # Transforms, textures, the other shapes, and helpers.
+    var checks = ap.make_texture(2, 2, function(int x, int y) returns ap.Color
+        return ap.BLUE
+    end)
+    ap.clear(ap.BLACK)
+    ap.begin_3d(camera)
+    ap.push_3d()
+    ap.translate_3d(ap.Vec3(-2, 0, 0))
+    ap.rotate_3d(45, ap.Vec3(0, 1, 0))
+    ap.scale_3d(ap.Vec3(0.5, 0.5, 0.5))
+    ap.draw(cube, ap.Vec3(0, 0, 0), ap.WHITE, ap.Vec3(0, 0, 0), ap.Vec3(1, 1, 1), checks)
+    ap.pop_3d()
+    ap.line_3d(ap.Vec3(1, -2, 0), ap.Vec3(1, 2, 0), ap.YELLOW)
+    ap.grid(4, 1, ap.GRAY)
+    ap.box_lines(ap.Vec3(-1, -1, -1), ap.Vec3(1, 1, 1), ap.WHITE)
+    ap.billboard(checks, ap.Vec3(2, 0, 0), 1, ap.WHITE)
+    ap.cull(false)
+    ap.depth_write(true)
+    ap.end_3d()
+    testing.assert_equal(pixel(ap.project(ap.Vec3(-2, 0, 0)).x, 60), ap.BLUE.packed())
+    testing.assert_equal(pixel(ap.project(ap.Vec3(2, 0, 0)).x, 60), ap.BLUE.packed())
+    testing.assert_equal(pixel(ap.project(ap.Vec3(1, 0, 0)).x, 30), ap.YELLOW.packed())
+
+    testing.assert_equal(ap.plane(4, 4, 2).triangles(), 2)
+    testing.assert_equal(ap.sphere(1, 8, 8).triangles(), 112)
+    testing.assert_equal(ap.cylinder(1, 2, 8).triangles(), 32)
+    testing.assert_equal(ap.cone(1, 2, 8).triangles(), 24)
+    testing.assert_equal(ap.torus(1, 0.25, 8, 6).triangles(), 96)
+    testing.assert(close_to(ap.sphere(1.5).radius(), 1.5))
+
+    var builder = ap.MeshBuilder()
+    builder.color(ap.GREEN)
+    var a = builder.vertex(ap.Vec3(-1, -1, 0))
+    var b = builder.vertex(ap.Vec3(1, -1, 0))
+    var c = builder.vertex(ap.Vec3(1, 1, 0), ap.Vec3(0, 0, 1), ap.Vec2(1, 0))
+    var d = builder.vertex(ap.Vec3(-1, 1, 0))
+    builder.quad(a, b, c, d)
+    builder.smooth()
+    var square = builder.build()
+    testing.assert_equal(square.triangles(), 2)
+    ap.clear(ap.BLACK)
+    ap.begin_3d(camera)
+    ap.draw(square, ap.Vec3(0, 0, 0))
+    ap.end_3d()
+    testing.assert_equal(pixel(100, 60), ap.GREEN.packed())
+    testing.expect_error(NativeError, function() => ap.MeshBuilder().build())
+
+    var path = fs.join(fs.temp_dir(), "aperture-test.obj")
+    fs.write(path, "v -1 -1 0\nv 1 -1 0\nv 1 1 0\nv -1 1 0\nvt 0 0\nf 1/1 2/1 3/1 4/1\n")
+    var loaded = ap.load_mesh(path)
+    testing.assert_equal(loaded.triangles(), 2)
+    fs.remove(path)
+    testing.expect_error(NativeError, function() => ap.load_mesh(path))
+    testing.expect_error(NativeError, function() => ap.draw(cube, ap.Vec3(0, 0, 0)))
+    cube.free()
+
+    # Orbit and first-person cameras.
+    var above = ap.orbit(ap.Vec3(0, 0, 0), 0, 90, 10)
+    testing.assert(above.position.y > 9.9)
+    var ahead = ap.look(ap.Vec3(0, 1, 0), 0, 0)
+    testing.assert(close_to(ahead.forward().z, -1))
+    var side = ap.look(ap.Vec3(0, 1, 0), 90, 0)
+    testing.assert(close_to(side.forward().x, 1))
+
+    # A flat (orthographic) view four units tall: one unit is 30 pixels of 120.
+    ap.clear(ap.BLACK)
+    ap.begin_3d(ap.Camera3D(ap.Vec3(0, 0, 5), ap.Vec3(0, 0, 0), ap.Vec3(0, 1, 0), -4))
+    ap.draw(square, ap.Vec3(0, 0, 0))
+    ap.end_3d()
+    testing.assert_equal(pixel(100 + 28, 60), ap.GREEN.packed())
+    testing.assert_equal(pixel(100 + 32, 60), ap.BLACK.packed())
+    ap.fog(ap.WHITE, 1, 2)
+    ap.no_fog()
+    ap.shine(0.5, 16)
+    ap.shine(0)
+    ap.wireframe(false)
+end
+
+function test_rays
+    var ray = ap.Ray(ap.Vec3(0, 0, 10), ap.Vec3(0, 0, -1))
+    testing.assert(ray.at(4) == ap.Vec3(0, 0, 6))
+    testing.assert_equal(ray.hits_sphere(ap.Vec3(0, 0, 0), 2), 8.0)
+    testing.assert_equal(ray.hits_sphere(ap.Vec3(5, 0, 0), 2), -1.0)
+    testing.assert_equal(ray.hits_sphere(ap.Vec3(0, 0, 20), 2), -1.0)
+    testing.assert_equal(ray.hits_box(ap.Vec3(-1, -1, -1), ap.Vec3(1, 1, 1)), 9.0)
+    testing.assert_equal(ray.hits_box(ap.Vec3(2, 2, -1), ap.Vec3(3, 3, 1)), -1.0)
+    testing.assert_equal(ray.hits_plane(ap.Vec3(0, 0, 0), ap.Vec3(0, 0, 1)), 10.0)
+    testing.assert_equal(ray.hits_plane(ap.Vec3(0, 0, 0), ap.Vec3(0, 1, 0)), -1.0)
+    testing.assert(ap.boxes_overlap(ap.Vec3(0, 0, 0), ap.Vec3(2, 2, 2), ap.Vec3(1, 1, 1),
+        ap.Vec3(3, 3, 3)))
+    testing.assert(not ap.boxes_overlap(ap.Vec3(0, 0, 0), ap.Vec3(1, 1, 1), ap.Vec3(2, 0, 0),
+        ap.Vec3(3, 1, 1)))
+    testing.assert(ap.spheres_overlap(ap.Vec3(0, 0, 0), 1, ap.Vec3(1.5, 0, 0), 1))
+end
+
+function test_input
+    testing.assert(not ap.key_down(ap.KEY_SPACE))
+    ap.send_key(ap.KEY_SPACE, true)
+    ap.frame()
+    testing.assert(ap.key_down(ap.KEY_SPACE) and ap.key_pressed(ap.KEY_SPACE))
+    testing.assert_equal(ap.any_key(), ap.KEY_SPACE)
+    ap.frame()
+    testing.assert(ap.key_down(ap.KEY_SPACE) and not ap.key_pressed(ap.KEY_SPACE))
+    ap.send_key(ap.KEY_SPACE, false)
+    ap.send_key(ap.KEY_D, true)
+    ap.send_key(ap.KEY_UP, true)
+    ap.frame()
+    testing.assert(ap.key_released(ap.KEY_SPACE) and not ap.key_down(ap.KEY_SPACE))
+    var direction = ap.steer()
+    testing.assert(close_to(direction.length(), 1) and direction.x > 0 and direction.y < 0)
+    ap.send_key(ap.KEY_D, false)
+    ap.send_key(ap.KEY_UP, false)
+    ap.frame()
+    testing.assert(ap.steer() == ap.Vec2(0, 0))
+    testing.assert_equal(ap.key_named("Space"), ap.KEY_SPACE)
+    testing.assert_equal(ap.key_named("Left"), ap.KEY_LEFT)
+    testing.assert_equal(ap.key_name(ap.KEY_ESCAPE), "Escape")
+    testing.assert_equal(ap.typed(), "")
+
+    ap.send_mouse(ap.Vec2(40, 30), ap.MOUSE_LEFT, true)
+    ap.frame()
+    testing.assert(ap.mouse() == ap.Vec2(40, 30))
+    testing.assert(ap.mouse_down() and ap.mouse_pressed() and not ap.mouse_down(ap.MOUSE_RIGHT))
+    ap.send_mouse(ap.Vec2(50, 30), ap.MOUSE_LEFT, false)
+    ap.frame()
+    testing.assert(ap.mouse_released() and not ap.mouse_down())
+    testing.assert_equal(ap.wheel().y, 0.0)
+    testing.assert(not ap.pad_connected())
+    testing.assert_equal(ap.pad_axis(ap.AXIS_LEFT_X), 0.0)
+    testing.assert(ap.pad_stick() == ap.Vec2(0, 0) and ap.pad_stick(true) == ap.Vec2(0, 0))
+    testing.assert(not ap.pad_down(ap.PAD_SOUTH) and not ap.pad_pressed(ap.PAD_START))
+    testing.assert_equal(ap.pad_name(), "")
+    ap.pad_rumble(0.5, 0.5, 0.1)
+end
+
+function test_window
+    testing.assert(ap.is_open())
+    testing.assert(ap.delta() > 0)
+    testing.assert(ap.time() >= 0)
+    testing.assert(ap.frame_count() > 0)
+    testing.assert(ap.fps() > 0)
+    ap.target_fps(0)
+    ap.vsync(false)
+    ap.set_title("renamed")
+    ap.collector_time(0.002)
+    testing.assert(not ap.is_fullscreen())
+    testing.expect_error(NativeError, function() => ap.open("second", 10, 10))
+
+    # A virtual size is letterboxed into the window: 160x100 fits 320x200 exactly.
+    ap.draw_to_window()
+    ap.virtual_size(160, 100)
+    testing.assert(ap.size() == ap.Vec2(160, 100))
+    testing.assert(ap.center() == ap.Vec2(80, 50))
+    ap.send_mouse(ap.Vec2(320, 200))
+    ap.frame()
+    testing.assert(ap.mouse() == ap.Vec2(160, 100))
+    ap.virtual_size(0, 0)
+    testing.assert(ap.size() == ap.Vec2(320, 200))
+
+    var canvas = stage
+    if canvas != null do
+        ap.draw_to(canvas)
+    end
+    ap.clear(ap.BLUE)
+    var shot = fs.join(fs.temp_dir(), "aperture-test.png")
+    ap.screenshot(shot)
+    testing.assert(fs.size(shot) > 50)
+    var again = ap.load_texture(shot, false)
+    testing.assert_equal(again.width, 200)
+    ap.sprite(again, 0, 0)
+    testing.assert_equal(pixel(100, 60), ap.BLUE.packed())
+    fs.remove(shot)
+end
+
+function test_sound
+    var beep = ap.tone(ap.WAVE_SQUARE, 440, 0.05)
+    testing.assert(close_to(beep.seconds(), 0.05, 0.001))
+    var slide = ap.tone(ap.WAVE_NOISE, 800, 0.1, 100, 0.2)
+    testing.assert(close_to(slide.seconds(), 0.1, 0.001))
+    ap.master_volume(0)
+    var voice = beep.play(0.5, 1.5)
+    var hum = slide.loop()
+    if ap.has_audio() do
+        testing.assert(voice != 0 and hum != 0 and hum != voice)
+        testing.assert(ap.playing(hum))
+        ap.set_volume(hum, 0.2)
+        ap.set_pitch(hum, 2)
+        ap.pause(hum)
+        ap.pause(hum, false)
+        ap.stop(hum)
+        testing.assert(not ap.playing(hum))
+    end
+    ap.stop_all()
+    testing.assert(not ap.playing(voice))
+    ap.master_volume(1)
+    testing.expect_error(NativeError, function() => ap.load_sound("no-such-sound.wav"))
+    testing.expect_error(NativeError, function() => ap.tone(ap.WAVE_SINE, 440, 0))
+    beep.free()
+    testing.expect_error(NativeError, function() => beep.play())
+end
+
+function test_helpers
+    testing.assert_equal(ap.lerp(10, 20, 0.25), 12.5)
+    testing.assert_equal(ap.approach(0, 10, 3), 3.0)
+    testing.assert_equal(ap.approach(9, 10, 3), 10.0)
+    testing.assert_equal(ap.approach(10, 0, 3), 7.0)
+    testing.assert_equal(ap.remap(5, 0, 10, 0, 100), 50.0)
+    testing.assert_equal(ap.smooth(0.5), 0.5)
+    testing.assert_equal(ap.smooth(2), 1.0)
+    testing.assert_equal(ap.ease_in(0.5), 0.125)
+    testing.assert_equal(ap.ease_out(0.5), 0.875)
+    var swing = ap.pulse(2)
+    testing.assert(swing >= 0 and swing <= 1)
+    for i in 0..<50 do
+        var r = ap.random(5, 6)
+        testing.assert(r >= 5 and r < 6)
+        testing.assert(ap.Rect(10, 10, 5, 5).contains(ap.random_in(ap.Rect(10, 10, 5, 5))))
+        testing.assert(close_to(ap.random_direction().length(), 1))
+    end
+    testing.assert(ap.chance(1) and not ap.chance(0))
+
+    var timer = ap.Timer(0.000001)
+    ap.frame()
+    testing.assert(timer.tick())
+    testing.assert(timer.progress() >= 0)
+    timer.reset()
+    testing.assert_equal(timer.elapsed, 0.0)
+    var slow = ap.Timer(1000)
+    testing.assert(not slow.tick())
+    testing.assert(slow.progress() < 0.1)
+end
+
+function test_animation_tilemap_particles
+    var sheet = ap.make_texture(4, 2, function(int x, int y) returns ap.Color
+        return ap.RED if x < 2 else ap.GREEN
+    end)
+    var blink = ap.Animation(sheet, 2, 2, [0, 1], 1000000)
+    testing.assert_equal(blink.current(), 0)
+    blink.clock = 1
+    testing.assert_equal(blink.current(), 1)
+    blink.clock = 2
+    testing.assert_equal(blink.current(), 0)
+    blink.clock = 1
+    blink.draw(ap.Vec2(50, 50), 10)
+    testing.assert_equal(pixel(50, 50), ap.GREEN.packed())
+    blink.update()
+    blink.restart()
+    testing.assert_equal(blink.clock, 0.0)
+    var once = ap.Animation(sheet, 2, 2, [0, 1], 10, false)
+    once.clock = 5
+    testing.assert(once.finished())
+    testing.assert_equal(once.current(), 1)
+    once.draw(ap.Vec2(100, 50), 10, true)
+
+    var world = ap.Tilemap(4, 3, 10)
+    world.set(1, 1, 2)
+    world.set(9, 9, 1)
+    testing.assert_equal(world.get(1, 1), 2)
+    testing.assert_equal(world.get(-1, 0), 0)
+    testing.assert_equal(world.at(ap.Vec2(15, 15)), 2)
+    testing.assert(world.cell(1, 1) == ap.Rect(10, 10, 10, 10))
+    testing.assert(world.blocked(ap.Rect(5, 5, 6, 6)))
+    testing.assert(not world.blocked(ap.Rect(0, 0, 10, 10)))
+    # Moving right into the tile stops; the move down still happens.
+    var body = world.slide(ap.Rect(0, 12, 8, 6), ap.Vec2(5, 1))
+    testing.assert(body == ap.Rect(0, 13, 8, 6))
+    ap.clear(ap.BLACK)
+    world.draw_colors([ap.RED, ap.BLUE])
+    testing.assert_equal(pixel(15, 15), ap.BLUE.packed())
+    testing.assert_equal(pixel(5, 5), ap.BLACK.packed())
+    world.set(0, 0, 2)
+    world.draw(sheet, 2)
+    testing.assert_equal(pixel(5, 5), ap.GREEN.packed())
+
+    var sparks = ap.Particles()
+    sparks.limit = 30
+    sparks.burst(ap.Vec2(100, 60), 20)
+    testing.assert_equal(sparks.count(), 20)
+    sparks.burst(ap.Vec2(100, 60), 20, 90, 10)
+    testing.assert_equal(sparks.count(), 30)
+    sparks.update()
+    sparks.draw()
+    sparks.life = 0.0000001
+    sparks.items = []
+    sparks.burst(ap.Vec2(0, 0), 5)
+    ap.frame()
+    sparks.update()
+    testing.assert_equal(sparks.count(), 0)
+end

@@ -1,0 +1,211 @@
+# Sparkwell: a small arcade game. Steer the lantern to the spark; shards drift across the
+# well and cost a life each. Every spark makes the well busier.
+#
+#     flywheel run examples/sparkwell.fw
+#
+# Shows a fixed virtual resolution, input, shapes and transforms, particles, synthesized
+# sound, and text.
+import "../aperture.fw" as ap
+import math
+
+const double WIDTH = 640
+const double HEIGHT = 360
+
+class Shard
+    ap.Vec2 position
+    ap.Vec2 velocity
+    double radius
+    double angle = 0
+    double spin = 90
+end
+
+ap.open("Sparkwell", 1280, 720, ap.RESIZABLE)
+ap.virtual_size(640, 360)
+
+var chime = ap.tone(ap.WAVE_TRIANGLE, 660, 0.18, 1320, 0.4)
+var crack = ap.tone(ap.WAVE_NOISE, 400, 0.3, 80, 0.5)
+var fall = ap.tone(ap.WAVE_SAW, 330, 0.9, 55, 0.4)
+
+var glow = ap.Particles()
+var debris = ap.Particles()
+debris.start = ap.CYAN
+debris.finish = ap.BLUE.fade(0)
+debris.speed = 220
+
+var player = ap.Vec2(WIDTH / 2, HEIGHT / 2)
+var velocity = ap.Vec2(0, 0)
+var spark = ap.Vec2(WIDTH / 2, 90)
+Shard[] shards = []
+var arrivals = ap.Timer(1.4)
+var score = 0
+var best = 0
+var lives = 3
+var shake = 0.0
+var safe = 0.0
+var playing = false
+var started = false
+
+function start()
+    player = ap.Vec2(WIDTH / 2, HEIGHT / 2)
+    velocity = ap.Vec2(0, 0)
+    shards = []
+    arrivals = ap.Timer(1.4)
+    score = 0
+    lives = 3
+    safe = 1.5
+    playing = true
+    started = true
+    place_spark()
+end
+
+function place_spark()
+    spark = ap.random_in(ap.Rect(40, 50, WIDTH - 80, HEIGHT - 90))
+    if spark.distance(player) < 120 do
+        spark = ap.Vec2(WIDTH - spark.x, HEIGHT - spark.y)
+    end
+end
+
+# A shard enters from a random edge and crosses the well.
+function add_shard()
+    var from = ap.Vec2(ap.random(0, WIDTH), -20)
+    var side = math.random_int(0, 3)
+    if side == 1 do
+        from = ap.Vec2(ap.random(0, WIDTH), HEIGHT + 20)
+    else if side == 2 do
+        from = ap.Vec2(-20, ap.random(0, HEIGHT))
+    else if side == 3 do
+        from = ap.Vec2(WIDTH + 20, ap.random(0, HEIGHT))
+    end
+    var aim = ap.random_in(ap.Rect(WIDTH * 0.25, HEIGHT * 0.25, WIDTH * 0.5, HEIGHT * 0.5))
+    var speed = ap.random(70, 110) + double(score) * 4
+    shards.push(Shard((from), (aim - from).normalized() * speed, ap.random(9, 16), ap.random(0, 360),
+        ap.random(-200, 200)))
+end
+
+function update(double dt)
+    velocity = velocity.lerp(ap.steer() * 250, math.min(dt * 9, 1.0))
+    player = player + velocity * dt
+    player = ap.Vec2(math.clamp(player.x, 12.0, WIDTH - 12), math.clamp(player.y, 12.0, HEIGHT - 12))
+    safe = math.max(safe - dt, 0.0)
+
+    if ap.circles_overlap(player, 10, spark, 9) do
+        score += 1
+        chime.play(0.6, 1 + double(score % 8) * 0.06)
+        glow.burst(spark, 26)
+        arrivals.interval = math.max(1.4 - double(score) * 0.07, 0.35)
+        place_spark()
+    end
+
+    if arrivals.tick() do
+        add_shard()
+    end
+    Shard[] remaining = []
+    for shard in shards do
+        shard.position = shard.position + shard.velocity * dt
+        shard.angle += shard.spin * dt
+        var gone = shard.position.x < -60 or shard.position.x > WIDTH + 60 or
+            shard.position.y < -60 or shard.position.y > HEIGHT + 60
+        if safe <= 0 and ap.circles_overlap(player, 9, shard.position, shard.radius * 0.8) do
+            lives -= 1
+            safe = 1.5
+            shake = 0.35
+            crack.play(0.7)
+            debris.burst(shard.position, 30)
+            gone = true
+        end
+        if not gone do
+            remaining.push(shard)
+        end
+    end
+    shards = remaining
+
+    if lives <= 0 do
+        playing = false
+        best = math.max(best, score)
+        fall.play(0.6)
+    end
+end
+
+function draw_shard(Shard shard)
+    ap.push()
+    ap.translate(shard.position.x, shard.position.y)
+    ap.rotate(shard.angle)
+    var r = shard.radius
+    ap.polygon([ap.Vec2(0, -r), ap.Vec2(r * 0.8, r * 0.3), ap.Vec2(0, r), ap.Vec2(-r * 0.8, r * 0.3)],
+        ap.Color(110, 190, 235))
+    ap.path([ap.Vec2(0, -r), ap.Vec2(r * 0.8, r * 0.3), ap.Vec2(0, r), ap.Vec2(-r * 0.8, r * 0.3)],
+        1.5, ap.WHITE, true)
+    ap.pop()
+end
+
+function draw()
+    ap.gradient(0, 0, WIDTH, HEIGHT, ap.Color(14, 18, 44), ap.Color(40, 22, 60))
+    # The whole scene shakes when a shard hits.
+    ap.push()
+    if shake > 0 do
+        var push = ap.random_direction() * (shake * 18)
+        ap.translate(push.x, push.y)
+    end
+    for i in 0..<8 do
+        ap.circle_lines(WIDTH / 2, HEIGHT / 2, 60 + double(i) * 46, 1, ap.WHITE.fade(0.05))
+    end
+
+    ap.blend(ap.BLEND_ADD)
+    ap.circle(spark.x, spark.y, 16 + 4 * ap.pulse(0.8), ap.YELLOW.fade(0.25))
+    ap.circle(player.x, player.y, 26, ap.ORANGE.fade(0.18))
+    ap.blend(ap.BLEND_ALPHA)
+    ap.circle(spark.x, spark.y, 5, ap.YELLOW)
+    ap.arc(spark.x, spark.y, 11, ap.time() * 180, ap.time() * 180 + 240, 2, ap.WHITE)
+
+    for shard in shards do
+        draw_shard(shard)
+    end
+    glow.draw()
+    debris.draw()
+
+    # The lantern blinks while it cannot be hurt.
+    if safe <= 0 or int(ap.time() * 12) % 2 == 0 do
+        ap.circle(player.x, player.y, 10, ap.ORANGE)
+        ap.circle(player.x, player.y, 6, ap.YELLOW)
+        var nose = velocity.limited(1) * 6
+        ap.circle(player.x + nose.x, player.y + nose.y, 3, ap.WHITE)
+    end
+    ap.pop()
+
+    ap.text("SPARKS {score}", 12, 10, 16)
+    ap.text("BEST {best}", 12, 30, 8, ap.GRAY)
+    for i in 0..<lives do
+        ap.circle(WIDTH - 20 - double(i) * 22, 18, 7, ap.ORANGE)
+    end
+    if not playing do
+        ap.rect(0, 0, WIDTH, HEIGHT, ap.BLACK.fade(0.55))
+        var title = "SPARKWELL" if not started else "THE LANTERN WENT OUT"
+        ap.text_centered(title, WIDTH / 2, 140, 32, ap.YELLOW)
+        if started do
+            ap.text_centered("{score} sparks", WIDTH / 2, 185, 16)
+        end
+        ap.text_centered("Enter to start - arrows or WASD to steer", WIDTH / 2, 230, 8,
+            ap.LIGHT_GRAY)
+    end
+end
+
+while ap.frame() do
+    var dt = ap.delta()
+    if playing do
+        update(dt)
+    else if ap.key_pressed(ap.KEY_ENTER) or ap.key_pressed(ap.KEY_SPACE) or
+            ap.pad_pressed(ap.PAD_START) do
+        start()
+    end
+    shake = math.max(shake - dt, 0.0)
+    glow.update()
+    debris.update()
+    if ap.key_pressed(ap.KEY_ESCAPE) do
+        ap.quit()
+    end
+    if ap.key_pressed(ap.KEY_F11) do
+        ap.fullscreen(not ap.is_fullscreen())
+    end
+    draw()
+end
+ap.close()

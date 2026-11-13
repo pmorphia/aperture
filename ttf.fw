@@ -1,0 +1,33 @@
+# TrueType and OpenType fonts for Aperture.
+#
+#     import aperture as ap
+#     import aperture.ttf
+#
+#     var title = ttf.load_font("assets/title.ttf", 48)
+#     ap.text("Game Over", 100, 80, 48, ap.WHITE, title)
+#
+# Needs the FreeType development package (pkg-config freetype2); programs that do not import
+# this module do not.
+import c native.ttf as nat
+import aperture
+
+# Loads a .ttf or .otf file, rendering its characters `size` pixels tall. Text drawn at that
+# size is sharpest; other sizes scale it. Covers Latin-1 (ASCII and Western European
+# letters).
+function load_font(string path, double size = 32) returns aperture.Font
+    var baked = nat.ttf_bake(path, size)
+    defer nat.ttf_free(baked)
+    var atlas = aperture.texture_from_memory(nat.ttf_pixels(baked), nat.ttf_width(baked),
+        nat.ttf_height(baked), true)
+    var font = aperture.Font(atlas, size, nat.ttf_line_height(baked))
+    for code in 32..255 do
+        if nat.ttf_has(baked, code) do
+            font.glyph(code,
+                aperture.Rect(nat.ttf_glyph(baked, code, 0), nat.ttf_glyph(baked, code, 1),
+                nat.ttf_glyph(baked, code, 2), nat.ttf_glyph(baked, code, 3)),
+                aperture.Vec2(nat.ttf_glyph(baked, code, 4), nat.ttf_glyph(baked, code, 5)),
+                nat.ttf_glyph(baked, code, 6))
+        end
+    end
+    return font
+end
