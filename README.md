@@ -25,8 +25,8 @@ flywheel run game.fw                # or: flywheel build game.fw -O3 -o game
 
 ## Requirements
 
-- Flywheel 2.20 (beta-20) or newer: Aperture uses structs, native handles, and
-  `// flywheel:` build directives.
+- Flywheel 2.21 (beta-21) or newer: Aperture uses structs, native handles, `// flywheel:`
+  build directives, and the built-in `vecmath` module.
 - SDL 3.2 or newer with its development files, found through `pkg-config sdl3` (Arch:
   `sdl3`; Debian/Ubuntu: `libsdl3-dev`; Fedora: `SDL3-devel`). PNG images and screenshots
   need SDL 3.4; older versions load and save BMP.
@@ -60,7 +60,12 @@ Multiply speeds by `delta()` so the game runs the same at any frame rate.
 
 `Vec2`, `Vec3`, `Color`, `Rect`, `Camera2D`, `Camera3D`, and `Ray` are structs: they are
 copied like numbers and cost nothing to create, so `position + velocity * dt` in a loop over
-ten thousand things allocates nothing.
+ten thousand things allocates nothing, and an array of them is one contiguous block.
+
+`Vec2`, `Vec3`, `Vec4`, `Mat4`, and `Quat` are Flywheel's built-in
+[vecmath](https://github.com/pmorphia/flywheel/blob/main/stdlib/README.md#vecmath) types,
+re-exported: `ap.Vec2` and `vecmath.Vec2` are the same type, so vectors from other libraries
+that use vecmath pass straight in.
 
 - `Vec2(x, y)`, `Vec3(x, y, z)`: `+ - * /`, unary `-`, `==`, `length`, `normalized`, `dot`,
   `cross`, `distance`, `lerp`, `scaled`; `Vec2` also has `angle`, `rotated`, `toward`,
@@ -212,7 +217,19 @@ high)`, `chance(probability)`, `random_in(rect)`, `random_direction()`; `circles
 ```sh
 flywheel run examples/hello.fw        # a window, input, text
 flywheel run examples/sparkwell.fw    # a small arcade game
+flywheel run examples/platformer.fw   # a tile map, jumps with coyote time, a following camera
+flywheel run examples/shooter.fw      # a top-down shooter: waves, aiming, many bullets
 flywheel run examples/gallery.fw      # a lit 3D scene with picking
+```
+
+`flywheel new game NAME` (or `pulley new NAME --game`) starts a project with Aperture as a
+dependency and a small playable game.
+
+To run a game unattended (tests, CI, thumbnails), `APERTURE_FRAMES=n` ends it after n frames
+and `APERTURE_SCREENSHOT=path` saves the last one:
+
+```sh
+SDL_VIDEODRIVER=offscreen APERTURE_FRAMES=120 APERTURE_SCREENSHOT=shot.png flywheel run game.fw
 ```
 
 ## Tests
