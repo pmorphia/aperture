@@ -1,7 +1,7 @@
 # Hollow Orbit: a top-down shooter. Move with WASD or the left stick, aim with the mouse or the
 # right stick, and hold the left button or the right trigger to fire. Drones come in waves.
 #
-#     flywheel run examples/shooter.fw
+#     flywheel examples/shooter.fw
 #
 # Shows many moving things kept in arrays of structs (bullets and drones allocate nothing per
 # frame), aiming through a camera, screen shake, additive glow, and synthesized sound.

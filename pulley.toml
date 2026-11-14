@@ -8,4 +8,4 @@ license = "MIT"
 exclude = ["tests/*", "tools/*", ".gitignore", "shots/*"]
 
 [scripts]
-test = "flywheel test tests/"
+test = "flywheel --test tests/"

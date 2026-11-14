@@ -1,7 +1,7 @@
 # Cinder Climb: a platformer. Run and jump to the beacon at the far end, collecting embers on
 # the way. Lava sends you back to the start.
 #
-#     flywheel run examples/platformer.fw
+#     flywheel examples/platformer.fw
 #
 # Shows a tile map built from text, collision with tiles, variable-height jumps with coyote
 # time and jump buffering, a camera that follows the player, particles, and a HUD drawn over

@@ -1,7 +1,7 @@
 # Gallery: a small 3D scene. Drag with the left mouse button to look around, scroll to zoom,
 # and point at a shape to name it.
 #
-#     flywheel run examples/gallery.fw
+#     flywheel examples/gallery.fw
 #
 # Shows cameras, built-in and hand-built meshes, textures, lights, fog, picking with a ray,
 # billboards, and 2D drawing on top of 3D.

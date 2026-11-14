@@ -20,7 +20,7 @@ ap.close()
 
 ```sh
 pulley add polymorphia.aperture     # in your project
-flywheel run game.fw                # or: flywheel build game.fw -O3 -o game
+flywheel game.fw                # or: flywheel --build game.fw -O3 -o game
 ```
 
 ## Requirements
@@ -215,28 +215,28 @@ high)`, `chance(probability)`, `random_in(rect)`, `random_direction()`; `circles
 ## Examples
 
 ```sh
-flywheel run examples/hello.fw        # a window, input, text
-flywheel run examples/sparkwell.fw    # a small arcade game
-flywheel run examples/platformer.fw   # a tile map, jumps with coyote time, a following camera
-flywheel run examples/shooter.fw      # a top-down shooter: waves, aiming, many bullets
-flywheel run examples/gallery.fw      # a lit 3D scene with picking
+flywheel examples/hello.fw        # a window, input, text
+flywheel examples/sparkwell.fw    # a small arcade game
+flywheel examples/platformer.fw   # a tile map, jumps with coyote time, a following camera
+flywheel examples/shooter.fw      # a top-down shooter: waves, aiming, many bullets
+flywheel examples/gallery.fw      # a lit 3D scene with picking
 ```
 
-`flywheel new game NAME` (or `pulley new NAME --game`) starts a project with Aperture as a
+`flywheel --new --game NAME` (or `pulley new NAME --game`) starts a project with Aperture as a
 dependency and a small playable game.
 
 To run a game unattended (tests, CI, thumbnails), `APERTURE_FRAMES=n` ends it after n frames
 and `APERTURE_SCREENSHOT=path` saves the last one:
 
 ```sh
-SDL_VIDEODRIVER=offscreen APERTURE_FRAMES=120 APERTURE_SCREENSHOT=shot.png flywheel run game.fw
+SDL_VIDEODRIVER=offscreen APERTURE_FRAMES=120 APERTURE_SCREENSHOT=shot.png flywheel game.fw
 ```
 
 ## Tests
 
 ```sh
-flywheel test tests/
-SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy flywheel test tests/    # with no display
+flywheel --test tests/
+SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy flywheel --test tests/    # with no display
 ```
 
 The tests open a hidden window, draw, and read the pixels back.

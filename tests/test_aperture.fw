@@ -1,4 +1,4 @@
-# flywheel test tests/
+# flywheel --test tests/
 #
 # Runs without a visible window. On a machine with no display, set SDL_VIDEODRIVER=offscreen
 # (and SDL_AUDIODRIVER=dummy when there is no sound card).

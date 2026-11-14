@@ -1,7 +1,7 @@
 # Sparkwell: a small arcade game. Steer the lantern to the spark; shards drift across the
 # well and cost a life each. Every spark makes the well busier.
 #
-#     flywheel run examples/sparkwell.fw
+#     flywheel examples/sparkwell.fw
 #
 # Shows a fixed virtual resolution, input, shapes and transforms, particles, synthesized
 # sound, and text.

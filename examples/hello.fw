@@ -1,6 +1,6 @@
 # The smallest Aperture program: a window, a shape you can move, and text.
 #
-#     flywheel run examples/hello.fw
+#     flywheel examples/hello.fw
 import "../aperture.fw" as ap
 
 ap.open("Hello, Aperture", 800, 450)
