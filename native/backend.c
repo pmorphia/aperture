@@ -2160,6 +2160,11 @@ void ap_text(long id, const char *text, double x, double y, double size, long r,
         return;
     AP_COLOR(color);
     float scale = (float)size / font->pixel_size, pen_x = (float)x, pen_y = (float)y;
+    /* Glyph quads are snapped to device pixels, each with the same pixel size, so a pixel font
+       at a fractional scale samples every copy of a letter the same way instead of splitting
+       its texels differently wherever it lands. The pen itself is not rounded, so the text's
+       width still matches ap_text_width. */
+    float device_x = A.view_w / A.logical_w, device_y = A.view_h / A.logical_h;
     while (*text) {
         int code = next_code(&text);
         if (code == '\n') {
@@ -2171,8 +2176,10 @@ void ap_text(long id, const char *text, double x, double y, double size, long r,
         if (!glyph)
             continue;
         if (glyph->w > 0 && glyph->h > 0 && code != ' ') {
-            float left = pen_x + glyph->xoff * scale, top = pen_y + glyph->yoff * scale;
-            float right = left + glyph->w * scale, bottom = top + glyph->h * scale;
+            float left = roundf((pen_x + glyph->xoff * scale) * device_x) / device_x;
+            float top = roundf((pen_y + glyph->yoff * scale) * device_y) / device_y;
+            float right = left + fmaxf(1, roundf(glyph->w * scale * device_x)) / device_x;
+            float bottom = top + fmaxf(1, roundf(glyph->h * scale * device_y)) / device_y;
             float xy[8] = {left, top, right, top, right, bottom, left, bottom};
             float u0 = glyph->x / atlas->width, v0 = glyph->y / atlas->height;
             float u1 = (glyph->x + glyph->w) / atlas->width;
