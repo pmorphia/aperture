@@ -5,7 +5,7 @@ sprites, text, cameras, meshes and glTF models with skeletal animation, physical
 materials, shadows, instancing, render targets, shaders, and sound, drawn with OpenGL through
 SDL3.
 
-Aperture is currently in its **beta** phase: version **2.1 (beta-1)**.
+Aperture is currently in its **beta** phase: version **2.2 (beta-2)**.
 
 ```flywheel
 import aperture as ap
