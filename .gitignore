@@ -1,3 +1,4 @@
 .flywheel-modules/
 *.png
 !docs/*.png
+!tests/models/*.png

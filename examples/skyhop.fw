@@ -1,0 +1,602 @@
+# Skyhop: a 3D platformer over the clouds. Collect the twelve crystals scattered across the
+# floating islands, then touch the beacon at the top to win.
+#
+#     flywheel examples/skyhop.fw
+#
+# Move with WASD, the arrow keys, or the left stick (relative to the camera); jump with Space
+# or the south button (hold it to jump higher). Turn the camera by dragging with the mouse,
+# with Q and E, or with the right stick; scroll to zoom. R restarts, Escape quits.
+#
+# Shows a third-person camera, box collision against static and moving platforms (the player
+# rides what it stands on), coyote time and jump buffering, bounce pads, patrolling hazards,
+# sun shadows (which show where a jump will land), materials with glow, instanced clouds, a
+# point light, 3D particles, and a 2D HUD drawn on top.
+import aperture as ap
+import math
+
+const double GRAVITY = 30
+const double JUMP_SPEED = 10.5
+const double BOUNCE_SPEED = 18
+const double RUN_SPEED = 6.5
+const double HALF_WIDTH = 0.3      # the player's box: 0.6 wide and deep, 1 tall, from the feet
+const double HEIGHT = 1.0
+const double COYOTE = 0.1          # seconds a jump still works after walking off an edge
+const double BUFFER = 0.12         # seconds a jump pressed early waits for the ground
+
+const int SOLID = 0
+const int MOVING = 1
+const int BOUNCY = 2
+
+# An island: a box whose top face is centered on `base`, moving `swing` away and back.
+class Platform
+    ap.Vec3 base
+    ap.Vec3 size
+    int kind = SOLID
+    ap.Vec3 swing = ap.Vec3(0, 0, 0)
+    double speed = 1
+    ap.Vec3 top = ap.Vec3(0, 0, 0)       # where its top center is this frame
+    ap.Vec3 moved = ap.Vec3(0, 0, 0)     # how far it moved this frame
+
+    function place(double t)
+        var now = this.base + this.swing * math.sin(t * this.speed)
+        this.moved = now - this.top
+        this.top = now
+    end
+    function low() returns ap.Vec3
+        return this.top - ap.Vec3(this.size.x / 2, this.size.y, this.size.z / 2)
+    end
+    function high() returns ap.Vec3
+        return this.top + ap.Vec3(this.size.x / 2, 0, this.size.z / 2)
+    end
+end
+
+class Crystal
+    int platform
+    ap.Vec3 offset
+    bool taken = false
+
+    function position(Platform[] islands) returns ap.Vec3
+        return islands[this.platform].top + this.offset +
+            ap.Vec3(0, math.sin(ap.time() * 2.5 + this.offset.x) * 0.15, 0)
+    end
+end
+
+# A spiked ball rolling back and forth across an island.
+class Sentinel
+    int platform
+    ap.Vec3 path
+    double speed
+
+    function position(Platform[] islands) returns ap.Vec3
+        return islands[this.platform].top + ap.Vec3(0, 0.45, 0) +
+            this.path * math.sin(ap.time() * this.speed)
+    end
+end
+
+struct Spark
+    ap.Vec3 position
+    ap.Vec3 velocity
+    double life = 0.8
+    ap.Color color = ap.WHITE
+end
+
+ap.open("Skyhop", 1280, 720, ap.RESIZABLE + ap.MSAA)
+ap.shadows(true, 2048, 0.7)
+ap.ambient(ap.Color(120, 135, 170))
+ap.sun(ap.Vec3(-0.25, -1, -0.35), ap.Color(255, 245, 225))
+var sky = ap.Color(150, 195, 240)
+ap.fog(sky, 30, 75)
+
+# --- The level -----------------------------------------------------------------------------
+
+Platform[] islands = [
+    Platform(ap.Vec3(0, 0, 0), ap.Vec3(8, 2, 8)),                               # 0 start
+    Platform(ap.Vec3(0, 0.8, -7), ap.Vec3(3, 1, 3)),
+    Platform(ap.Vec3(4.5, 1.6, -10), ap.Vec3(3, 1, 3)),
+    Platform(ap.Vec3(9.5, 1.6, -10), ap.Vec3(3, 0.5, 3), MOVING, ap.Vec3(0, 0, 3), 1.2),
+    Platform(ap.Vec3(14.5, 2.4, -12), ap.Vec3(5, 1.5, 5)),                      # 4 sentinel
+    Platform(ap.Vec3(14.5, 2.4, -18.5), ap.Vec3(3, 1, 3), BOUNCY),
+    Platform(ap.Vec3(14.5, 7, -24), ap.Vec3(5, 1.5, 5)),
+    Platform(ap.Vec3(8.5, 7.6, -25.5), ap.Vec3(5, 0.8, 1.6)),                   # 7 bridge
+    Platform(ap.Vec3(2.5, 8.2, -27), ap.Vec3(3, 0.5, 3), MOVING, ap.Vec3(0, 1.6, 0), 1.0),
+    Platform(ap.Vec3(-3.5, 9.6, -27), ap.Vec3(4.5, 1.5, 4.5)),                  # 9 sentinel
+    Platform(ap.Vec3(-8.5, 10.4, -23), ap.Vec3(3, 1, 3)),
+    Platform(ap.Vec3(-11.5, 11.2, -17), ap.Vec3(3, 0.5, 3), MOVING, ap.Vec3(3, 0, 0), 0.9),
+    Platform(ap.Vec3(-12, 12, -10.5), ap.Vec3(4.5, 1.5, 4.5)),                  # 12 sentinel
+    Platform(ap.Vec3(-8, 12.8, -5.5), ap.Vec3(2.5, 1, 2.5)),
+    Platform(ap.Vec3(-2.5, 13.6, -2.5), ap.Vec3(6, 2, 6)),                      # 14 goal
+    Platform(ap.Vec3(-7, 0.6, 4), ap.Vec3(2.5, 1, 2.5)),                        # 15 side trips
+    Platform(ap.Vec3(21, 3.2, -11), ap.Vec3(2.5, 1, 2.5)),
+    Platform(ap.Vec3(5, 0.4, 7.5), ap.Vec3(2.5, 0.5, 2.5), MOVING, ap.Vec3(3, 0, 0), 0.8)
+]
+const int GOAL = 14
+
+Crystal[] crystals = [
+    Crystal(1, ap.Vec3(0, 1, 0)), Crystal(3, ap.Vec3(0, 1, 0)), Crystal(4, ap.Vec3(1.5, 1, 1.5)),
+    Crystal(15, ap.Vec3(0, 1, 0)), Crystal(16, ap.Vec3(0, 1, 0)), Crystal(17, ap.Vec3(0, 1, 0)),
+    Crystal(6, ap.Vec3(0, 2.4, 0)), Crystal(7, ap.Vec3(0, 1, 0)), Crystal(8, ap.Vec3(0, 1, 0)),
+    Crystal(9, ap.Vec3(-1.5, 1, 1.5)), Crystal(11, ap.Vec3(0, 1, 0)), Crystal(12, ap.Vec3(1.5, 1, -1.5))
+]
+
+Sentinel[] sentinels = [
+    Sentinel(4, ap.Vec3(1.9, 0, 0), 1.6),
+    Sentinel(9, ap.Vec3(0, 0, 1.7), 1.9),
+    Sentinel(12, ap.Vec3(1.7, 0, 1.7), 2.2)
+]
+
+for island in islands do
+    island.place(0)
+    island.moved = ap.Vec3(0, 0, 0)
+end
+
+# --- Looks ---------------------------------------------------------------------------------
+
+var box = ap.cube(1, 1, 1)
+var ball = ap.sphere(0.5, 16, 24)
+var gem = ap.sphere(0.32, 2, 4)        # two rings and four slices make an octahedron
+var spike = ap.cone(0.12, 0.35, 8)
+var rock = ap.cone(0.5, 1, 7)
+var body = ap.cylinder(0.3, 0.55, 20)
+var pillar = ap.cylinder(0.35, 2.2, 6)
+
+var dirt = ap.Material(ap.Color(125, 92, 66), 0, 0.95)
+var stone = ap.Material(ap.Color(110, 108, 118), 0, 0.9)
+var grass = ap.Material(ap.Color(105, 175, 80), 0, 0.85)
+var lilac = ap.Material(ap.Color(150, 140, 230), 0, 0.6)
+var spring = ap.Material(ap.Color(255, 120, 170), 0.1, 0.4)
+spring.glow(ap.Color(255, 90, 150), 0.4)
+var shard = ap.Material(ap.Color(30, 60, 80), 0.3, 0.15)
+shard.glow(ap.Color(70, 220, 255), 2.2)
+var cloud = ap.Material(ap.WHITE, 0, 1)
+cloud.unlit(true)
+var danger = ap.Material(ap.Color(200, 40, 50), 0.6, 0.35)
+var beacon_dark = ap.Material(ap.Color(70, 70, 90), 0.5, 0.3)
+var beacon_lit = ap.Material(ap.Color(255, 230, 140), 0.2, 0.2)
+beacon_lit.glow(ap.Color(255, 210, 90), 3)
+
+# A sea of clouds far below, all drawn with one call.
+ap.Mat4[] puffs = []
+while puffs.length < 260 do
+    var place = ap.Vec3(ap.random(-70, 70), ap.random(-16, -13), ap.random(-80, 60))
+    var width = ap.random(3, 8)
+    puffs.push(ap.transform(place, ap.Vec3(0, ap.random(0, 360), 0),
+        ap.Vec3(width, width * 0.35, width * ap.random(0.6, 1))))
+end
+
+var jump_sound = ap.tone(ap.WAVE_SQUARE, 330, 0.12, 620, 0.15)
+var bounce_sound = ap.tone(ap.WAVE_SINE, 180, 0.35, 900, 0.4)
+var crystal_sound = ap.tone(ap.WAVE_TRIANGLE, 990, 0.25, 1980, 0.3)
+var fall_sound = ap.tone(ap.WAVE_SAW, 420, 0.6, 70, 0.3)
+var hit_sound = ap.tone(ap.WAVE_NOISE, 600, 0.3, 100, 0.4)
+var lit_sound = ap.tone(ap.WAVE_TRIANGLE, 440, 0.8, 880, 0.4)
+var win_sound = ap.tone(ap.WAVE_SQUARE, 523, 0.9, 1046, 0.3)
+
+# --- The player and the game ---------------------------------------------------------------
+
+var position = ap.Vec3(0, 0, 2)    # the feet
+var velocity = ap.Vec3(0, 0, 0)
+var heading = 180.0                # degrees around y; 0 faces +z
+var standing = -1                  # the island under the feet, or -1 in the air
+var air_time = 0.0
+var jump_wait = 0.0
+var hopping = false                # rising from a jump (not a bounce): letting go cuts it short
+var stunned = 0.0                  # seconds before a hazard can hit again
+var squash = 0.0                   # a landing squash that springs back
+var stride = 0.0
+var checkpoint = 0
+var falls = 0
+var taken = 0
+var clock = 0.0
+var won = false
+var best = 0.0
+var shown_help = 6.0
+Spark[] sparks = []
+
+var yaw = 0.0
+var pitch = 24.0
+var distance = 9.0
+var eye = position + ap.Vec3(0, 1, 0)
+
+function restart()
+    position = ap.Vec3(0, 0, 2)
+    velocity = ap.Vec3(0, 0, 0)
+    heading = 180
+    hopping = false
+    stunned = 0
+    checkpoint = 0
+    falls = 0
+    taken = 0
+    clock = 0
+    won = false
+    sparks = []
+    for crystal in crystals do
+        crystal.taken = false
+    end
+end
+
+function burst(ap.Vec3 at, int count, ap.Color color, double speed)
+    for i in 0..<count do
+        var direction = ap.Vec3(ap.random(-1, 1), ap.random(-0.3, 1), ap.random(-1, 1)).normalized()
+        sparks.push(Spark(at, direction * (speed * ap.random(0.4, 1)), ap.random(0.5, 0.9), color))
+    end
+end
+
+# Back to the last solid island stood on.
+function respawn()
+    falls += 1
+    fall_sound.play(0.5)
+    position = islands[checkpoint].top + ap.Vec3(0, 0.5, 0)
+    velocity = ap.Vec3(0, 0, 0)
+    standing = -1
+    burst(position + ap.Vec3(0, 0.5, 0), 24, ap.WHITE, 4)
+end
+
+function overlapping(int index) returns bool
+    var island = islands[index]
+    var low = position - ap.Vec3(HALF_WIDTH, 0, HALF_WIDTH)
+    var high = position + ap.Vec3(HALF_WIDTH, HEIGHT, HALF_WIDTH)
+    return ap.boxes_overlap(low, high, island.low(), island.high())
+end
+
+# Moves along one axis (0 x, 1 y, 2 z) and steps back out of any island the move went into.
+function slide(int axis, double amount)
+    if axis == 0 do
+        position = position + ap.Vec3(amount, 0, 0)
+    else if axis == 1 do
+        position = position + ap.Vec3(0, amount, 0)
+    else do
+        position = position + ap.Vec3(0, 0, amount)
+    end
+    for i in 0..<islands.length do
+        if not overlapping(i) do
+            continue
+        end
+        var island = islands[i]
+        if axis == 0 do
+            var x = island.low().x - HALF_WIDTH - 0.001 if position.x < island.top.x else island.high().x + HALF_WIDTH + 0.001
+            position = ap.Vec3(x, position.y, position.z)
+            velocity = ap.Vec3(0, velocity.y, velocity.z)
+        else if axis == 2 do
+            var z = island.low().z - HALF_WIDTH - 0.001 if position.z < island.top.z else island.high().z + HALF_WIDTH + 0.001
+            position = ap.Vec3(position.x, position.y, z)
+            velocity = ap.Vec3(velocity.x, velocity.y, 0)
+        else if amount <= 0 or position.y > island.top.y - 0.3 do
+            # Landed on top.
+            position = ap.Vec3(position.x, island.top.y, position.z)
+            if standing < 0 and velocity.y < -6 do
+                squash = math.min(-velocity.y * 0.025, 0.35)
+                burst(position, 8, ap.Color(235, 230, 215), 2)
+            end
+            standing = i
+            hopping = false
+            if island.kind == BOUNCY do
+                velocity = ap.Vec3(velocity.x, BOUNCE_SPEED, velocity.z)
+                standing = -1
+                hopping = false
+                squash = 0.4
+                bounce_sound.play(0.5)
+                burst(position, 16, ap.PINK, 5)
+            else do
+                velocity = ap.Vec3(velocity.x, 0, velocity.z)
+                if island.kind == SOLID do
+                    checkpoint = i
+                end
+            end
+        else do
+            # Bumped a head on the underside.
+            position = ap.Vec3(position.x, island.low().y - HEIGHT - 0.001, position.z)
+            velocity = ap.Vec3(velocity.x, 0, velocity.z)
+        end
+    end
+end
+
+function update(double dt)
+    clock += dt
+    for island in islands do
+        island.place(ap.time())
+    end
+    # Ride whatever is underfoot.
+    if standing >= 0 do
+        position = position + islands[standing].moved
+    end
+
+    # The camera.
+    if ap.mouse_down(ap.MOUSE_LEFT) or ap.mouse_down(ap.MOUSE_RIGHT) do
+        var motion = ap.mouse_delta()
+        yaw -= motion.x * 0.3
+        pitch = math.clamp(pitch + motion.y * 0.2, 5.0, 70.0)
+    end
+    var turn = 0.0
+    if ap.key_down(ap.KEY_Q) do
+        turn += 1
+    end
+    if ap.key_down(ap.KEY_E) do
+        turn -= 1
+    end
+    var stick = ap.pad_stick(true)
+    if math.abs(stick.x) > 0.2 do
+        turn -= stick.x
+    end
+    if math.abs(stick.y) > 0.2 do
+        pitch = math.clamp(pitch + stick.y * 90 * dt, 5.0, 70.0)
+    end
+    yaw += turn * 120 * dt
+    distance = math.clamp(distance - ap.wheel().y * 0.8, 4.0, 18.0)
+
+    # Running, relative to where the camera looks.
+    var a = yaw * math.PI / 180
+    var forward = ap.Vec3(-math.sin(a), 0, -math.cos(a))
+    var right = ap.Vec3(math.cos(a), 0, -math.sin(a))
+    var input = ap.steer()
+    var want = (right * input.x - forward * input.y) * RUN_SPEED
+    var grip = 14.0 if standing >= 0 else 5.0
+    var flat = ap.Vec3(velocity.x, 0, velocity.z).lerp(want, math.min(dt * grip, 1.0))
+    velocity = ap.Vec3(flat.x, velocity.y, flat.z)
+    if input.length() > 0.1 do
+        var target = math.atan2(want.x, want.z) * 180 / math.PI
+        var difference = (target - heading + 540) % 360 - 180
+        heading += difference * math.min(dt * 12, 1.0)
+    end
+    if standing >= 0 do
+        stride += flat.length() * dt * 2.2
+    end
+
+    # Jumping.
+    air_time = 0.0 if standing >= 0 else air_time + dt
+    jump_wait = math.max(jump_wait - dt, 0.0)
+    if ap.key_pressed(ap.KEY_SPACE) or ap.pad_pressed(ap.PAD_SOUTH) do
+        jump_wait = BUFFER
+    end
+    if jump_wait > 0 and air_time < COYOTE and velocity.y <= 0.01 do
+        velocity = ap.Vec3(velocity.x, JUMP_SPEED, velocity.z)
+        jump_wait = 0
+        air_time = COYOTE
+        standing = -1
+        hopping = true
+        jump_sound.play(0.3, ap.random(0.95, 1.05))
+    end
+    var holding = ap.key_down(ap.KEY_SPACE) or ap.pad_down(ap.PAD_SOUTH)
+    if not holding and hopping and velocity.y > 0 do
+        velocity = ap.Vec3(velocity.x, velocity.y - GRAVITY * 1.5 * dt, velocity.z)   # short hop
+    end
+    velocity = ap.Vec3(velocity.x, math.max(velocity.y - GRAVITY * dt, -30.0), velocity.z)
+
+    # Moving, one axis at a time so walls stop one direction and not the others.
+    slide(0, velocity.x * dt)
+    slide(2, velocity.z * dt)
+    var was = standing
+    standing = -1
+    slide(1, velocity.y * dt)
+    if standing < 0 and was >= 0 and air_time == 0 do
+        air_time = dt    # walked off an edge: coyote time starts
+    end
+    squash = math.max(squash - dt * 2.5, 0.0)
+
+    if position.y < -12 do
+        respawn()
+    end
+
+    # Hazards knock the player away.
+    var middle = position + ap.Vec3(0, 0.5, 0)
+    stunned = math.max(stunned - dt, 0.0)
+    for sentinel in sentinels do
+        var at = sentinel.position(islands)
+        if stunned <= 0 and ap.spheres_overlap(middle, 0.4, at, 0.5) do
+            var away = ap.Vec3(middle.x - at.x, 0, middle.z - at.z).normalized()
+            velocity = away * 11 + ap.Vec3(0, 7, 0)
+            standing = -1
+            hopping = false
+            stunned = 0.5
+            hit_sound.play(0.5)
+            burst(middle, 20, ap.RED, 5)
+        end
+    end
+
+    # Crystals.
+    for crystal in crystals do
+        if not crystal.taken and ap.spheres_overlap(middle, 0.5, crystal.position(islands), 0.45) do
+            crystal.taken = true
+            taken += 1
+            crystal_sound.play(0.5, 1 + double(taken) * 0.04)
+            burst(crystal.position(islands), 30, ap.CYAN, 4)
+            if taken == crystals.length do
+                lit_sound.play(0.6)
+            end
+        end
+    end
+
+    # The beacon.
+    var beacon = islands[GOAL].top + ap.Vec3(0, 1.1, 0)
+    if taken == crystals.length and ap.spheres_overlap(middle, 0.5, beacon, 0.9) do
+        won = true
+        best = clock if best == 0 else math.min(best, clock)
+        win_sound.play(0.5)
+        burst(beacon, 80, ap.YELLOW, 7)
+    end
+end
+
+function update_sparks(double dt)
+    Spark[] alive = []
+    for spark in sparks do
+        var life = spark.life - dt
+        if life > 0 do
+            var moving = spark.velocity + ap.Vec3(0, -6 * dt, 0)
+            alive.push(Spark(spark.position + moving * dt, moving, life, spark.color))
+        end
+    end
+    sparks = alive
+end
+
+function draw_player()
+    var lean = ap.Vec3(math.clamp(velocity.y * -1.2, -8.0, 8.0), 0, 0)
+    var running = ap.Vec3(velocity.x, 0, velocity.z).length() / RUN_SPEED
+    var swing = math.sin(stride * math.PI) * 0.18 * running if standing >= 0 else 0.1
+    ap.push_3d()
+    ap.translate_3d(position)
+    ap.rotate_3d(heading, ap.Vec3(0, 1, 0))
+    ap.rotate_3d(lean.x, ap.Vec3(1, 0, 0))
+    ap.scale_3d(ap.Vec3(1 + squash * 0.5, 1 - squash, 1 + squash * 0.5))
+    ap.draw(ball, ap.Vec3(-0.14, 0.1, swing), ap.Color(70, 60, 80), ap.Vec3(0, 0, 0), ap.Vec3(0.26, 0.2, 0.34))
+    ap.draw(ball, ap.Vec3(0.14, 0.1, -swing), ap.Color(70, 60, 80), ap.Vec3(0, 0, 0), ap.Vec3(0.26, 0.2, 0.34))
+    ap.draw(body, ap.Vec3(0, 0.45, 0), ap.Color(255, 140, 40))
+    ap.draw(ball, ap.Vec3(0, 0.72, 0), ap.Color(255, 140, 40), ap.Vec3(0, 0, 0), ap.Vec3(0.6, 0.3, 0.6))
+    ap.draw(ball, ap.Vec3(0, 0.92, 0), ap.Color(255, 220, 180), ap.Vec3(0, 0, 0), ap.Vec3(0.5, 0.46, 0.5))
+    if not ap.casting_shadows() do
+        ap.draw(ball, ap.Vec3(-0.1, 0.96, 0.21), ap.Color(30, 30, 40), ap.Vec3(0, 0, 0), ap.Vec3(0.08, 0.12, 0.06))
+        ap.draw(ball, ap.Vec3(0.1, 0.96, 0.21), ap.Color(30, 30, 40), ap.Vec3(0, 0, 0), ap.Vec3(0.08, 0.12, 0.06))
+    end
+    ap.pop_3d()
+end
+
+function draw_world()
+    var shadows = ap.casting_shadows()
+    for i, island in islands do
+        var top = island.top
+        var size = island.size
+        var cover = grass
+        if island.kind == MOVING do
+            cover = lilac
+        else if island.kind == BOUNCY do
+            cover = spring
+        end
+        ap.draw_material(box, dirt if island.kind == SOLID else stone, top - ap.Vec3(0, size.y / 2, 0),
+            ap.Vec3(0, 0, 0), size)
+        ap.draw_material(box, cover, top - ap.Vec3(0, 0.12, 0), ap.Vec3(0, 0, 0),
+            ap.Vec3(size.x + 0.1, 0.26, size.z + 0.1))
+        # Solid islands hang over the clouds on a point of rock.
+        if island.kind == SOLID and not shadows do
+            var reach = math.min(size.x, size.z) * 0.9
+            ap.draw_material(rock, dirt, top - ap.Vec3(0, size.y + reach * 0.5, 0), ap.Vec3(180, double(i) * 37, 0),
+                ap.Vec3(math.min(size.x, size.z) * 0.9, reach, math.min(size.x, size.z) * 0.9))
+        end
+    end
+
+    for crystal in crystals do
+        if not crystal.taken do
+            ap.draw_material(gem, shard, crystal.position(islands), ap.Vec3(0, ap.time() * 90, 0),
+                ap.Vec3(1, 1.5, 1))
+        end
+    end
+
+    for sentinel in sentinels do
+        var at = sentinel.position(islands)
+        var spin = ap.time() * 200
+        ap.draw_material(ball, danger, at, ap.Vec3(spin, 0, 0), ap.Vec3(0.8, 0.8, 0.8))
+        ap.push_3d()
+        ap.translate_3d(at)
+        ap.rotate_3d(spin, ap.Vec3(1, 0, 0))
+        for k in 0..<6 do
+            var turn = ap.Vec3(90, 0, 0)
+            if k == 1 do
+                turn = ap.Vec3(-90, 0, 0)
+            else if k == 2 do
+                turn = ap.Vec3(0, 0, 90)
+            else if k == 3 do
+                turn = ap.Vec3(0, 0, -90)
+            else if k == 4 do
+                turn = ap.Vec3(0, 0, 0)
+            else if k == 5 do
+                turn = ap.Vec3(180, 0, 0)
+            end
+            ap.push_3d()
+            ap.rotate_3d(turn.x, ap.Vec3(1, 0, 0))
+            ap.rotate_3d(turn.z, ap.Vec3(0, 0, 1))
+            ap.draw(spike, ap.Vec3(0, 0.45, 0), ap.LIGHT_GRAY)
+            ap.pop_3d()
+        end
+        ap.pop_3d()
+    end
+
+    # The beacon: dark until every crystal is found.
+    var lit = taken == crystals.length
+    var beacon = islands[GOAL].top
+    ap.draw_material(pillar, beacon_lit if lit else beacon_dark, beacon + ap.Vec3(0, 1.1, 0),
+        ap.Vec3(0, ap.time() * (60.0 if lit else 0.0), 0))
+    ap.draw_material(gem, shard if lit else beacon_dark, beacon + ap.Vec3(0, 2.9 + ap.pulse(2) * 0.2, 0),
+        ap.Vec3(0, ap.time() * 120, 0), ap.Vec3(2, 2.6, 2))
+
+    draw_player()
+
+    if not shadows do
+        ap.draw_many(ball, puffs, cloud)
+        ap.lighting(false)
+        for spark in sparks do
+            ap.draw(box, spark.position, spark.color.fade(math.min(spark.life * 2, 1.0)), ap.Vec3(0, 0, 0),
+                ap.Vec3(0.09, 0.09, 0.09))
+        end
+        ap.lighting(true)
+    end
+end
+
+function seconds(double t) returns string
+    var tenths = int(t * 10)
+    var whole = tenths // 10
+    var minutes = whole // 60
+    var rest = whole % 60
+    var pad = "0" if rest < 10 else ""
+    return "{minutes}:{pad}{rest}.{tenths % 10}"
+end
+
+function draw_hud()
+    var w = ap.width()
+    var h = ap.height()
+    # Crystals found, one diamond each.
+    for i in 0..<crystals.length do
+        var x = 28 + double(i) * 22
+        var color = ap.CYAN if i < taken else ap.WHITE.fade(0.25)
+        ap.triangle(ap.Vec2(x, 18), ap.Vec2(x + 8, 30), ap.Vec2(x - 8, 30), color)
+        ap.triangle(ap.Vec2(x - 8, 30), ap.Vec2(x + 8, 30), ap.Vec2(x, 44), color)
+    end
+    ap.text("{taken} / {crystals.length}", 28 + double(crystals.length) * 22, 24, 20)
+    ap.text(seconds(clock), w - 130, 20, 24)
+    ap.text("falls {falls}", w - 130, 50, 16, ap.LIGHT_GRAY)
+    if taken == crystals.length and not won do
+        ap.text_centered("The beacon is lit - climb to the top!", w / 2, 70, 20, ap.YELLOW)
+    end
+    if shown_help > 0 and not won do
+        var fade = math.min(shown_help, 1.0)
+        ap.fill(ap.Rect(w / 2 - 330, h - 92, 660, 64), ap.BLACK.fade(0.45 * fade))
+        ap.text_centered("WASD or arrows run, Space jumps (hold for higher)", w / 2, h - 74, 16,
+            ap.WHITE.fade(fade))
+        ap.text_centered("drag the mouse or Q / E to turn the camera, scroll to zoom", w / 2, h - 50,
+            16, ap.LIGHT_GRAY.fade(fade))
+    end
+    if won do
+        ap.fill(ap.Rect(0, 0, w, h), ap.BLACK.fade(0.5))
+        ap.text_centered("SKYHOP!", w / 2, h / 2 - 80, 64, ap.YELLOW)
+        ap.text_centered("all {crystals.length} crystals in {seconds(clock)} with {falls} falls", w / 2,
+            h / 2, 24)
+        ap.text_centered("best {seconds(best)}", w / 2, h / 2 + 36, 20, ap.LIGHT_GRAY)
+        ap.text_centered("Enter to play again", w / 2, h / 2 + 80, 16, ap.LIGHT_GRAY)
+    end
+end
+
+while ap.frame() do
+    var dt = math.min(ap.delta(), 1.0 / 30)     # a long frame must not tunnel through floors
+    if ap.key_pressed(ap.KEY_ESCAPE) do
+        ap.quit()
+    end
+    if ap.key_pressed(ap.KEY_R) or (won and (ap.key_pressed(ap.KEY_ENTER) or ap.pad_pressed(ap.PAD_START))) do
+        restart()
+    end
+    if not won do
+        update(dt)
+    end
+    update_sparks(dt)
+    shown_help = math.max(shown_help - dt, 0.0)
+
+    # The camera follows smoothly, a little above the player.
+    eye = eye.lerp(position + ap.Vec3(0, 1.2, 0), math.min(dt * 8, 1.0))
+    var camera = ap.orbit(eye, yaw, pitch, distance)
+    if taken == crystals.length do
+        ap.light(0, islands[GOAL].top + ap.Vec3(0, 3, 0), ap.Color(255, 210, 120), 14)
+    else do
+        ap.light_off(0)
+    end
+
+    ap.clear(sky)
+    ap.gradient(0, 0, ap.width(), ap.height(), ap.Color(95, 150, 225), sky)
+    ap.scene_3d(camera, draw_world, 14)
+    draw_hud()
+end
+ap.close()

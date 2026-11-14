@@ -1,0 +1,468 @@
+# Models, materials, instancing, and shadows. tests/models/ comes from tools/test_models.py.
+import "../aperture.fw" as ap
+import fs
+import math
+import testing
+
+private function close_to(double actual, double expected, double tolerance = 0.0001) returns bool
+    return math.abs(actual - expected) <= tolerance
+end
+
+ap.Canvas? stage = null
+string models = "tests/models/"
+
+function setup_all
+    ap.open("aperture model tests", 320, 200, ap.HIDDEN + ap.NO_VSYNC)
+    stage = ap.Canvas(200, 120)
+    for place in ["tests/models/", "models/", "aperture/tests/models/"] do
+        if fs.exists(place + "bend.gltf") do
+            models = place
+        end
+    end
+end
+function teardown_all
+    stage = null
+    ap.close()
+end
+function setup
+    ap.frame()
+    var canvas = stage
+    if canvas != null do
+        ap.draw_to(canvas)
+    end
+    ap.clear(ap.BLACK)
+    ap.lighting(false)
+    ap.shadows(false)
+    ap.ambient(ap.Color(90, 90, 90))
+    ap.sun(ap.Vec3(-0.4, -1, -0.6), ap.Color(204, 204, 204))
+end
+private function pixel(double x, double y) returns int
+    return ap.read_pixel(x, y)
+end
+# Channel 0 (red) to 2 (blue) of a packed pixel.
+private function channel(int packed, int index) returns int
+    return packed // [16777216, 65536, 256][index] % 256
+end
+private function near_color(int packed, ap.Color color, int tolerance = 2) returns bool
+    return math.abs(channel(packed, 0) - color.r) <= tolerance and
+        math.abs(channel(packed, 1) - color.g) <= tolerance and
+        math.abs(channel(packed, 2) - color.b) <= tolerance
+end
+private function brightness(int packed) returns int
+    return channel(packed, 0) + channel(packed, 1) + channel(packed, 2)
+end
+private function front() returns ap.Camera3D
+    return ap.Camera3D(ap.Vec3(0, 0, 5), ap.Vec3(0, 0, 0))
+end
+private function draw_cube(ap.Material material)
+    ap.clear(ap.BLACK)
+    ap.begin_3d(front())
+    ap.draw_material(ap.cube(2, 2, 2), material, ap.Vec3(0, 0, 0))
+    ap.end_3d()
+end
+
+function test_materials
+    # Unlit, a material shows its color exactly.
+    var red = ap.Material(ap.RED)
+    red.unlit(true)
+    draw_cube(red)
+    testing.assert(near_color(pixel(100, 60), ap.RED))
+
+    # Lit from the front, a rough white surface is nearly white; from behind, it gets only the
+    # ambient light.
+    ap.lighting(true)
+    ap.ambient(ap.Color(50, 50, 50))
+    ap.sun(ap.Vec3(0, 0, -1), ap.WHITE)
+    var white = ap.Material(ap.WHITE, 0, 1)
+    draw_cube(white)
+    testing.assert(brightness(pixel(100, 60)) > 3 * 240)
+    ap.sun(ap.Vec3(0, 0, 1), ap.WHITE)
+    draw_cube(white)
+    testing.assert(near_color(pixel(100, 60), ap.Color(50, 50, 50), 6))
+
+    # Glow shows without any light.
+    ap.lighting(false)
+    var screen = ap.Material(ap.BLACK)
+    screen.glow(ap.GREEN)
+    draw_cube(screen)
+    testing.assert(near_color(pixel(100, 60), ap.GREEN))
+    ap.lighting(true)
+    ap.ambient(ap.BLACK)
+
+    # A normal map tilted away from the sun darkens the face; a flat one leaves it as it was.
+    ap.sun(ap.Vec3(0, 0, -1), ap.WHITE)
+    var flat = ap.make_texture(2, 2, function(int x, int y) returns ap.Color
+        return ap.Color(128, 128, 255)
+    end)
+    var tilted = ap.make_texture(2, 2, function(int x, int y) returns ap.Color
+        return ap.Color(240, 128, 160)
+    end)
+    var bumpy = ap.Material(ap.WHITE, 0, 1)
+    bumpy.normal_map(flat)
+    draw_cube(bumpy)
+    var straight = brightness(pixel(100, 60))
+    testing.assert(straight > 3 * 235)
+    bumpy.normal_map(tilted)
+    draw_cube(bumpy)
+    testing.assert(brightness(pixel(100, 60)) < straight - 60)
+    bumpy.normal_map(tilted, 0)
+    draw_cube(bumpy)
+    testing.assert(math.abs(brightness(pixel(100, 60)) - straight) <= 6)
+
+    # Metal gets its color from reflections, not from diffuse light.
+    var metal = ap.Material(ap.WHITE, 1, 1)
+    draw_cube(metal)
+    testing.assert(brightness(pixel(100, 60)) < straight - 100)
+
+    # Cut-out pixels show what is behind them; a texture tints the base color.
+    ap.lighting(false)
+    var half = ap.make_texture(2, 1, function(int x, int y) returns ap.Color
+        return ap.Color(255, 255, 0, 255 * x)
+    end)
+    var fence = ap.Material(ap.WHITE, 0, 1, half)
+    fence.cutoff(0.5)
+    fence.unlit(true)
+    draw_cube(fence)
+    testing.assert(near_color(pixel(115, 60), ap.Color(255, 255, 0)))
+    testing.assert_equal(pixel(85, 60), ap.BLACK.packed())
+
+    # A transparent material blends over what is behind it.
+    var glass = ap.Material(ap.Color(0, 0, 255, 128))
+    glass.unlit(true)
+    glass.transparent(true)
+    ap.clear(ap.BLACK)
+    ap.begin_3d(front())
+    ap.draw(ap.cube(2, 2, 2), ap.Vec3(0, 0, -2), ap.RED)
+    ap.draw_material(ap.cube(1, 1, 1), glass, ap.Vec3(0, 0, 1))
+    ap.end_3d()
+    var mixed = pixel(100, 60)
+    testing.assert(channel(mixed, 0) > 100 and channel(mixed, 0) < 160)
+    testing.assert(channel(mixed, 2) > 100 and channel(mixed, 2) < 160)
+
+    # Two-sided materials show their back faces.
+    var sheet = ap.Material(ap.GREEN)
+    sheet.unlit(true)
+    ap.clear(ap.BLACK)
+    ap.begin_3d(front())
+    ap.draw_material(ap.plane(2, 2), sheet, ap.Vec3(0, 0, 0), ap.Vec3(-90, 0, 0))
+    ap.end_3d()
+    testing.assert_equal(pixel(100, 60), ap.BLACK.packed())
+    sheet.two_sided(true)
+    ap.begin_3d(front())
+    ap.draw_material(ap.plane(2, 2), sheet, ap.Vec3(0, 0, 0), ap.Vec3(-90, 0, 0))
+    ap.end_3d()
+    testing.assert(near_color(pixel(100, 60), ap.GREEN))
+    red.free()
+    red.free()
+end
+
+function test_instancing
+    var a = ap.transform(ap.Vec3(1, 2, 3), ap.Vec3(10, 20, 30), ap.Vec3(2, 3, 4))
+    var b = ap.Mat4.translation(ap.Vec3(1, 2, 3)) * ap.Mat4.rotation(ap.Vec3(0, 0, 1), 30) *
+        ap.Mat4.rotation(ap.Vec3(0, 1, 0), 20) * ap.Mat4.rotation(ap.Vec3(1, 0, 0), 10) *
+        ap.Mat4.scaling(ap.Vec3(2, 3, 4))
+    for row in 0..<4 do
+        for column in 0..<4 do
+            testing.assert(close_to(a.at(row, column), b.at(row, column)))
+        end
+    end
+
+    var cube = ap.cube(1, 1, 1)
+    ap.Mat4[] places = [ap.transform(ap.Vec3(-2, 0, 0)), ap.transform(ap.Vec3(0, 0, 0)),
+        ap.transform(ap.Vec3(2, 0, 0))]
+    ap.Color[] colors = [ap.RED, ap.GREEN, ap.BLUE]
+    ap.begin_3d(front())
+    ap.draw_many(cube, places, null, colors)
+    var left = ap.project(ap.Vec3(-2, 0, 0))
+    var right = ap.project(ap.Vec3(2, 0, 0))
+    ap.end_3d()
+    testing.assert(near_color(pixel(left.x, left.y), ap.RED))
+    testing.assert(near_color(pixel(100, 60), ap.GREEN))
+    testing.assert(near_color(pixel(right.x, right.y), ap.BLUE))
+    testing.assert_equal(pixel(100, 5), ap.BLACK.packed())
+
+    # The current 3D transform applies to every instance, and a tint to all of them; with no
+    # colors (or the wrong number) the instances are untinted.
+    ap.clear(ap.BLACK)
+    ap.begin_3d(front())
+    ap.push_3d()
+    ap.translate_3d(ap.Vec3(0, 1, 0))
+    ap.draw_many(cube, places, null, [], ap.YELLOW)
+    ap.pop_3d()
+    var raised = ap.project(ap.Vec3(2, 1, 0))
+    ap.end_3d()
+    testing.assert(near_color(pixel(raised.x, raised.y), ap.YELLOW))
+    testing.assert_equal(pixel(100, 75), ap.BLACK.packed())
+
+    # Many instances in one draw, with a material.
+    ap.Mat4[] crowd = []
+    for i in 0..<5000 do
+        crowd.push(ap.transform(ap.Vec3(double(i % 100) * 0.1 - 5, double(i // 100) * 0.1 - 2.5,
+            -1), ap.Vec3(0, 0, 0), ap.Vec3(0.1, 0.1, 0.1)))
+    end
+    var blue = ap.Material(ap.BLUE)
+    blue.unlit(true)
+    ap.clear(ap.BLACK)
+    ap.begin_3d(front())
+    ap.draw_many(cube, crowd, blue)
+    ap.draw_many(cube, [], blue)
+    ap.end_3d()
+    testing.assert(near_color(pixel(100, 60), ap.BLUE))
+    testing.expect_error(NativeError, function() => ap.draw_many(cube, places))
+end
+
+function test_shadows
+    var ground = ap.plane(10, 10)
+    var block = ap.cube(1, 1, 1)
+    var camera = ap.Camera3D(ap.Vec3(0, 5, 5), ap.Vec3(0, 0, 0))
+    ap.lighting(true)
+    ap.ambient(ap.Color(60, 60, 60))
+    ap.sun(ap.Vec3(0, -1, 0), ap.WHITE)
+
+    testing.expect_error(NativeError, function() => ap.begin_shadows(ap.Vec3(0, 0, 0)))
+    ap.shadows(true, 1024, 1)
+    testing.assert(ap.shadows_on())
+    var casting = false
+    var scene = function()
+        if ap.casting_shadows() do
+            casting = true
+        end
+        ap.draw(ground, ap.Vec3(0, 0, 0))
+        ap.draw(block, ap.Vec3(0, 2, 0))
+        ap.line_3d(ap.Vec3(0, 0, 0), ap.Vec3(0, 3, 0), ap.RED)
+    end
+    ap.scene_3d(camera, scene)
+    testing.assert(casting)
+    testing.assert(not ap.casting_shadows())
+    ap.begin_3d(camera)
+    var under = ap.project(ap.Vec3(0, 0, 0.2))
+    var open = ap.project(ap.Vec3(2.5, 0, 0.2))
+    ap.end_3d()
+    var shaded = brightness(pixel(under.x + 3, under.y))
+    var sunny = brightness(pixel(open.x, open.y))
+    testing.assert(sunny > 3 * 240)
+    testing.assert(shaded < 3 * 80)
+
+    # Without shadows, the same spot is in the sun.
+    ap.shadows(false)
+    ap.clear(ap.BLACK)
+    ap.scene_3d(camera, scene)
+    testing.assert(brightness(pixel(under.x + 3, under.y)) > 3 * 240)
+
+    # Shadow strength 0 draws no darkening; begin_shadows by hand works like scene_3d.
+    ap.shadows(true, 512, 0)
+    ap.clear(ap.BLACK)
+    ap.scene_3d(camera, scene)
+    testing.assert(brightness(pixel(under.x + 3, under.y)) > 3 * 240)
+    ap.shadows(true, 512, 1)
+    ap.clear(ap.BLACK)
+    ap.begin_shadows(ap.Vec3(0, 0, 0), 6)
+    testing.expect_error(NativeError, function() => ap.begin_3d(camera))
+    testing.expect_error(NativeError, function() => ap.begin_shadows(ap.Vec3(0, 0, 0)))
+    ap.draw(block, ap.Vec3(0, 2, 0))
+    ap.end_shadows()
+    ap.begin_3d(camera)
+    ap.draw(ground, ap.Vec3(0, 0, 0))
+    ap.end_3d()
+    testing.assert(brightness(pixel(under.x + 3, under.y)) < 3 * 80)
+
+    # The next frame starts without a shadow map until it draws one.
+    ap.frame()
+    var canvas = stage
+    if canvas != null do
+        ap.draw_to(canvas)
+    end
+    ap.clear(ap.BLACK)
+    ap.begin_3d(camera)
+    ap.draw(ground, ap.Vec3(0, 0, 0))
+    ap.end_3d()
+    testing.assert(brightness(pixel(under.x + 3, under.y)) > 3 * 240)
+    ap.shadows(false)
+    testing.assert(not ap.shadows_on())
+end
+
+function test_gltf_binary
+    var tiles = ap.load_model(models + "tiles.glb")
+    var red = ap.Color(255, 0, 0)
+    var green = ap.Color(0, 255, 0)
+    var blue = ap.Color(0, 0, 255)
+    testing.assert_equal(tiles.triangles(), 2)
+    testing.assert(tiles.low() == ap.Vec3(1.5, -0.5, 0))
+    testing.assert(tiles.high() == ap.Vec3(2.5, 0.5, 0))
+    testing.assert(tiles.size() == ap.Vec3(1, 1, 0))
+    testing.assert_equal(tiles.nodes().length, 2)
+    testing.assert_equal(tiles.animations().length, 0)
+    testing.assert_equal(tiles.materials().length, 1)
+    testing.assert(tiles.node_position("tile") == ap.Vec3(2, 0, 0))
+
+    # The embedded 2x2 image: red and green on top, blue and white below.
+    var camera = ap.Camera3D(ap.Vec3(2, 0, 3), ap.Vec3(2, 0, 0))
+    ap.begin_3d(camera)
+    ap.draw_model(tiles, ap.Vec3(0, 0, 0))
+    var top_left = ap.project(ap.Vec3(1.75, 0.25, 0))
+    var top_right = ap.project(ap.Vec3(2.25, 0.25, 0))
+    var bottom_left = ap.project(ap.Vec3(1.75, -0.25, 0))
+    var bottom_right = ap.project(ap.Vec3(2.25, -0.25, 0))
+    ap.end_3d()
+    testing.assert(near_color(pixel(top_left.x, top_left.y), red))
+    testing.assert(near_color(pixel(top_right.x, top_right.y), green))
+    testing.assert(near_color(pixel(bottom_left.x, bottom_left.y), blue))
+    testing.assert(near_color(pixel(bottom_right.x, bottom_right.y), ap.WHITE))
+
+    # A material given to draw_model replaces the model's; the model's own can be changed.
+    var purple = ap.Material(ap.PURPLE)
+    purple.unlit(true)
+    ap.clear(ap.BLACK)
+    ap.begin_3d(camera)
+    ap.draw_model(tiles, ap.Vec3(0, 0, 0), ap.WHITE, ap.Vec3(0, 0, 0), ap.Vec3(1, 1, 1), purple)
+    ap.end_3d()
+    testing.assert(near_color(pixel(top_left.x, top_left.y), ap.PURPLE))
+    var own = tiles.materials()[0]
+    own.color(ap.Color(255, 0, 0))
+    ap.clear(ap.BLACK)
+    ap.begin_3d(camera)
+    ap.draw_model(tiles, ap.Vec3(0, 0, 0))
+    ap.end_3d()
+    testing.assert_equal(pixel(top_right.x, top_right.y), ap.BLACK.packed())
+    own.free()
+    tiles.free()
+    testing.expect_error(NativeError, function() => tiles.low())
+end
+
+function test_skinning_and_animation
+    var bend = ap.load_model(models + "bend.gltf")
+    testing.assert_equal(", ".join(bend.animations()), "Bend, Lift")
+    testing.assert_equal(", ".join(bend.nodes()), "root, lower, upper, strip")
+    testing.assert(bend.has_animation("Lift"))
+    testing.assert(not bend.has_animation("Fly"))
+    testing.assert_equal(bend.length("Bend"), 1.0)
+    testing.assert_equal(bend.length("Lift"), 0.5)
+    testing.expect_error(ValueError, function() => bend.play("Fly", 0))
+    testing.expect_error(ValueError, function() => bend.node_position("tail"))
+
+    var camera = ap.Camera3D(ap.Vec3(0, 1, 6), ap.Vec3(0, 1, 0))
+    ap.begin_3d(camera)
+    ap.draw_model(bend, ap.Vec3(0, 0, 0))
+    var tip = ap.project(ap.Vec3(0, 1.8, 0))
+    var bent_tip = ap.project(ap.Vec3(-0.8, 1.0, 0))
+    ap.end_3d()
+    testing.assert(near_color(pixel(tip.x, tip.y), ap.Color(255, 0, 0), 1))
+    testing.assert_equal(pixel(bent_tip.x, bent_tip.y), ap.BLACK.packed())
+
+    # A quarter turn at the joint swings the upper half over to the left.
+    bend.play("Bend", 1, false)
+    var turn = bend.node_rotation("upper")
+    testing.assert(close_to(turn.z, math.sqrt(0.5)) and close_to(turn.w, math.sqrt(0.5)))
+    testing.assert(bend.node_position("upper") == ap.Vec3(0, 1, 0))
+    ap.clear(ap.BLACK)
+    ap.begin_3d(camera)
+    ap.draw_model(bend, ap.Vec3(0, 0, 0))
+    ap.end_3d()
+    testing.assert_equal(pixel(tip.x, tip.y), ap.BLACK.packed())
+    testing.assert(near_color(pixel(bent_tip.x, bent_tip.y), ap.Color(255, 0, 0), 1))
+
+    # Halfway through, and blended halfway from the start: both an eighth of a turn.
+    bend.play("Bend", 0.5)
+    testing.assert(close_to(bend.node_rotation("upper").z, math.sin(math.PI / 8), 0.001))
+    bend.play("Bend", 0)
+    bend.blend("Bend", 1, 0.5, false)
+    testing.assert(close_to(bend.node_rotation("upper").z, math.sin(math.PI / 8), 0.001))
+    bend.play("Bend", 1.5)
+    testing.assert(close_to(bend.node_rotation("upper").z, math.sin(math.PI / 8), 0.001))
+    bend.play("Bend", 1.5, false)
+    testing.assert(close_to(bend.node_rotation("upper").z, math.sqrt(0.5)))
+
+    # Step interpolation jumps; play() starts from the rest pose, blend() does not.
+    bend.play("Lift", 0.25, false)
+    testing.assert_equal(bend.node_position("root").y, 0.0)
+    bend.play("Lift", 0.6, false)
+    testing.assert_equal(bend.node_position("root").y, 1.0)
+    testing.assert_equal(bend.node_position("upper").y, 2.0)
+    bend.play("Lift", 0.6)
+    testing.assert_equal(bend.node_position("root").y, 0.0)
+    bend.play("Bend", 1, false)
+    bend.blend("Lift", 0.6, 1, false)
+    testing.assert_equal(bend.node_position("upper").y, 2.0)
+    testing.assert(close_to(bend.node_rotation("upper").w, math.sqrt(0.5)))
+    bend.rest()
+    testing.assert_equal(bend.node_position("root").y, 0.0)
+    testing.assert(close_to(bend.node_rotation("upper").w, 1))
+
+    # Nodes can be posed by hand, and node transforms follow.
+    bend.turn_node("upper", ap.Quat.from_axis_angle(ap.Vec3(0, 0, 1), 90))
+    bend.move_node("root", ap.Vec3(0, 0, 3))
+    testing.assert(bend.node_position("upper") == ap.Vec3(0, 1, 3))
+    var hand = bend.node_transform("upper")
+    testing.assert(close_to(hand.transform_point(ap.Vec3(0, 1, 0)).x, -1))
+
+    # Skinned models draw in instances, all in one pose, and cast shadows.
+    bend.rest()
+    ap.shadows(true, 512, 1)
+    ap.clear(ap.BLACK)
+    ap.scene_3d(camera, function()
+        ap.draw_model_many(bend, [ap.transform(ap.Vec3(-1.5, 0, 0)), ap.transform(ap.Vec3(1.5,
+            0, 0))])
+    end)
+    ap.begin_3d(camera)
+    var left = ap.project(ap.Vec3(-1.5, 1.8, 0))
+    ap.end_3d()
+    testing.assert(near_color(pixel(left.x, left.y), ap.Color(255, 0, 0), 1))
+    ap.shadows(false)
+end
+
+function test_obj_with_materials
+    var crate = ap.load_model(models + "crate.obj")
+    testing.assert_equal(crate.triangles(), 12)
+    testing.assert_equal(crate.materials().length, 2)
+    testing.assert(crate.low() == ap.Vec3(-0.5, -0.5, -0.5))
+    var camera = ap.Camera3D(ap.Vec3(0, 0, 3), ap.Vec3(0, 0, 0))
+    ap.begin_3d(camera)
+    ap.draw_model(crate, ap.Vec3(0, 0, 0))
+    ap.end_3d()
+    # The front face is "wood", textured by crate.png.
+    testing.assert(near_color(pixel(100, 60), ap.Color(0, 200, 255)))
+    # The top is "metal": orange, metallic.
+    ap.clear(ap.BLACK)
+    ap.begin_3d(ap.Camera3D(ap.Vec3(0, 3, 0.01), ap.Vec3(0, 0, 0)))
+    ap.draw_model(crate, ap.Vec3(0, 0, 0))
+    ap.end_3d()
+    testing.assert(near_color(pixel(100, 60), ap.Color(255, 128, 0), 3))
+    # load_mesh still reads the geometry alone.
+    testing.assert_equal(ap.load_mesh(models + "crate.obj").triangles(), 12)
+end
+
+function test_broken_models
+    var dir = fs.temp_dir()
+    var cases = [
+        "not json at all",
+        "{{\"asset\": {{\"version\": \"1.0\"}}}}",
+        "{{\"asset\": {{\"version\": \"2.0\"}}, \"extensionsRequired\": [\"KHR_draco_mesh_compression\"]}}",
+        "{{\"asset\": {{\"version\": \"2.0\"}}, \"buffers\": [{{\"byteLength\": 4, \"uri\": \"missing.bin\"}}]}}",
+        "{{\"asset\": {{\"version\": \"2.0\"}}, \"buffers\": [{{\"byteLength\": 8, \"uri\": \"data:application/octet-stream;base64,AAAAAA==\"}}]}}",
+        "{{\"asset\": {{\"version\": \"2.0\"}}, \"buffers\": [{{\"byteLength\": 4, \"uri\": \"data:application/octet-stream;base64,AAAAAA==\"}}], \"bufferViews\": [{{\"buffer\": 0, \"byteLength\": 4}}], \"accessors\": [{{\"bufferView\": 0, \"componentType\": 5126, \"count\": 3, \"type\": \"VEC3\"}}], \"meshes\": [{{\"primitives\": [{{\"attributes\": {{\"POSITION\": 0}}}}]}}]}}",
+        "{{\"asset\": {{\"version\": \"2.0\"}}, \"buffers\": [{{\"byteLength\": 4, \"uri\": \"data:application/octet-stream;base64,AAAAAA==\"}}], \"bufferViews\": [{{\"buffer\": 0, \"byteOffset\": 2, \"byteLength\": 4}}], \"accessors\": [{{\"bufferView\": 0, \"componentType\": 5121, \"count\": 3, \"type\": \"SCALAR\"}}], \"meshes\": [{{\"primitives\": [{{\"attributes\": {{\"POSITION\": 0}}}}]}}]}}",
+        "{{\"asset\": {{\"version\": \"2.0\"}}, \"nodes\": [{{\"children\": [1]}}, {{\"children\": [0]}}]}}",
+        "{{\"asset\": {{\"version\": \"2.0\"}}, \"nodes\": [{{\"children\": [7]}}]}}",
+        "[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]",
+        "{{\"asset\": {{\"version\": \"2.0\"}}, \"accessors\": ["
+    ]
+    for i in 0..<cases.length do
+        var path = fs.join(dir, "aperture-broken-{i}.gltf")
+        fs.write(path, cases[i])
+        testing.expect_error(NativeError, function() => ap.load_model(path))
+        fs.remove(path)
+    end
+    # A glTF with no meshes loads as an empty model.
+    var path = fs.join(dir, "aperture-empty.gltf")
+    fs.write(path, "{{\"asset\": {{\"version\": \"2.0\"}}, \"nodes\": [{{\"name\": \"\\u00e9t\\u00e9\"}}]}}")
+    var empty = ap.load_model(path)
+    testing.assert_equal(empty.triangles(), 0)
+    testing.assert_equal(empty.nodes()[0], "été")
+    fs.remove(path)
+    var glb = fs.join(dir, "aperture-cut.glb")
+    fs.write(glb, "glTF\u{2}\u{0}\u{0}\u{0}\u{7f}\u{0}\u{0}\u{0}")
+    testing.expect_error(NativeError, function() => ap.load_model(glb))
+    fs.remove(glb)
+    testing.expect_error(NativeError, function() => ap.load_model(fs.join(dir, "nowhere.glb")))
+    testing.expect_error(NativeError, function() => ap.load_model(fs.join(dir, "nowhere.obj")))
+end

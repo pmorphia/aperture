@@ -1,0 +1,168 @@
+# Showroom: shadows, materials, instancing, and models. Drag with the left mouse button to
+# look around, scroll to zoom, Space to stop the sun, and 1 to 3 to switch animations.
+#
+#     flywheel examples/showroom.fw
+#     flywheel examples/showroom.fw -- character.glb    # also shows a model of yours
+#
+# Shows the sun's shadows through scene_3d, a row of physically based materials from matte to
+# polished and from plastic to metal, a normal-mapped wall, glow, a forest of 1500 trees
+# drawn with two instanced calls, and (given a glTF or OBJ file) a model with its animations.
+import "../aperture.fw" as ap
+import math
+import os
+
+ap.open("Showroom", 1280, 720, ap.RESIZABLE + ap.MSAA)
+ap.shadows(true, 2048, 0.8)
+ap.ambient(ap.Color(95, 105, 130))
+
+# A model of yours, if one was named.
+ap.Model? model = null
+string[] clips = []
+var clip = 0
+var arguments = os.args()
+if arguments.length > 0 do
+    var loaded = ap.load_model(arguments[0])
+    clips = loaded.animations()
+    print("{arguments[0]}: {loaded.triangles()} triangles, {loaded.nodes().length} nodes, " +
+        "animations {clips}")
+    model = loaded
+end
+
+var ground = ap.plane(60, 60)
+var grass = ap.Material(ap.Color(96, 140, 72), 0, 0.95)
+var ball = ap.sphere(0.45, 32, 48)
+var block = ap.cube(1, 1, 1)
+
+# Five spheres from matte to polished, in plastic and in gold.
+ap.Material[] plastics = []
+ap.Material[] metals = []
+for i in 0..<5 do
+    var roughness = 0.1 + double(i) * 0.2
+    plastics.push(ap.Material(ap.Color(200, 40, 50), 0, roughness))
+    metals.push(ap.Material(ap.hex("#ffc850"), 1, roughness))
+end
+
+# A brick wall: its color and a normal map are painted here, no image files needed.
+private function brick_at(int x, int y) returns bool
+    var row = y // 16
+    var shifted = x + (8 if row % 2 == 1 else 0)
+    return y % 16 >= 2 and shifted % 32 >= 2
+end
+var bricks = ap.make_texture(64, 64, function(int x, int y) returns ap.Color
+    var shade = (x * 7 + y * 13) % 9
+    return ap.Color(150 + shade * 3, 70 + shade, 50) if brick_at(x, y) else ap.Color(170, 165,
+        150)
+end, true)
+var bumps = ap.make_texture(64, 64, function(int x, int y) returns ap.Color
+    # Mortar lines sink in: their edges lean the surface toward them.
+    var dx = 0
+    var dy = 0
+    if brick_at(x, y) and not brick_at(x - 2, y) do
+        dx = -60
+    else if brick_at(x, y) and not brick_at(x + 2, y) do
+        dx = 60
+    end
+    if brick_at(x, y) and not brick_at(x, y - 2) do
+        dy = 60
+    else if brick_at(x, y) and not brick_at(x, y + 2) do
+        dy = -60
+    end
+    return ap.Color(128 + dx, 128 + dy, 235)
+end, true)
+bricks.repeat(true)
+bumps.repeat(true)
+var wall_material = ap.Material(ap.WHITE, 0, 0.85, bricks)
+wall_material.normal_map(bumps)
+var wall = ap.plane(6, 3, 3)
+
+# A glowing crystal.
+var crystal = ap.Material(ap.Color(30, 40, 60), 0.2, 0.2)
+crystal.glow(ap.Color(80, 200, 255), 2)
+
+# A forest: every trunk in one draw, every crown in another.
+var trunk = ap.cylinder(0.12, 1, 8)
+var crown = ap.cone(0.7, 1.8, 10)
+var bark = ap.Material(ap.Color(100, 70, 45), 0, 0.9)
+var leaves = ap.Material(ap.Color(60, 120, 60), 0, 0.8)
+ap.Mat4[] trunks = []
+ap.Mat4[] crowns = []
+ap.Color[] shades = []
+while trunks.length < 1500 do
+    var place = ap.Vec3(ap.random(-29, 29), 0, ap.random(-29, 29))
+    if place.length() < 15 do
+        continue
+    end
+    var height = ap.random(0.7, 1.5)
+    var turn = ap.Vec3(0, ap.random(0, 360), 0)
+    trunks.push(ap.transform(place + ap.Vec3(0, 0.5 * height, 0), turn, ap.Vec3(1, height, 1)))
+    crowns.push(ap.transform(place + ap.Vec3(0, height + 0.8 * height, 0), turn,
+        ap.Vec3(height, height, height)))
+    shades.push(ap.hsv(ap.random(80, 140), ap.random(0.2, 0.5), ap.random(0.8, 1)))
+end
+
+var yaw = 30.0
+var pitch = 22.0
+var distance = 12.0
+var sun_angle = 40.0
+var sun_moving = true
+
+while ap.frame() do
+    if ap.mouse_down(ap.MOUSE_LEFT) do
+        var motion = ap.mouse_delta()
+        yaw -= motion.x * 0.3
+        pitch = math.clamp(pitch + motion.y * 0.3, 5.0, 85.0)
+    end
+    distance = math.clamp(distance - ap.wheel().y, 4.0, 40.0)
+    if ap.key_pressed(ap.KEY_ESCAPE) do
+        ap.quit()
+    end
+    if ap.key_pressed(ap.KEY_SPACE) do
+        sun_moving = not sun_moving
+    end
+    for i in 0..<3 do
+        if ap.key_pressed(ap.KEY_1 + i) and i < clips.length do
+            clip = i
+        end
+    end
+    if sun_moving do
+        sun_angle += 8 * ap.delta()
+    end
+    var a = sun_angle * math.PI / 180
+    ap.sun(ap.Vec3(math.cos(a), -1.2, math.sin(a)), ap.Color(255, 244, 225))
+
+    var shown = model
+    if shown != null and clips.length > 0 do
+        shown.play(clips[clip], ap.time())
+    end
+
+    var camera = ap.orbit(ap.Vec3(0, 1, 0), yaw, pitch, distance)
+    ap.clear(ap.Color(150, 190, 235))
+    ap.scene_3d(camera, function()
+        if not ap.casting_shadows() do
+            ap.draw_material(ground, grass, ap.Vec3(0, 0, 0))
+        end
+        for i in 0..<5 do
+            var x = double(i) * 1.1 - 2.2
+            ap.draw_material(ball, plastics[i], ap.Vec3(x, 0.5, 2))
+            ap.draw_material(ball, metals[i], ap.Vec3(x, 0.5, 3.2))
+        end
+        ap.draw_material(wall, wall_material, ap.Vec3(0, 1.5, -2), ap.Vec3(90, 0, 0))
+        ap.draw_material(block, crystal, ap.Vec3(-4, 0.9, 0), ap.Vec3(45, ap.time() * 40, 35),
+            ap.Vec3(0.6, 0.6, 0.6))
+        ap.draw_many(trunk, trunks, bark)
+        ap.draw_many(crown, crowns, leaves, shades)
+        if shown != null do
+            # Scaled to two units tall and stood on the ground.
+            var size = shown.size()
+            var scale = 2 / math.max(size.y, 0.001)
+            ap.draw_model(shown, ap.Vec3(3.5, -shown.low().y * scale, -0.5), ap.WHITE,
+                ap.Vec3(0, -30, 0), ap.Vec3(scale, scale, scale))
+        end
+    end, 16)
+
+    ap.text("{int(ap.fps())} fps   drag to look, scroll to zoom, Space stops the sun", 12, 12)
+    if clips.length > 0 do
+        ap.text("animation: {clips[clip]} (1 to {math.min(clips.length, 3)} switch)", 12, 36)
+    end
+end
+ap.close()

@@ -990,7 +990,7 @@ end
 function torus(double radius = 0.5, double tube = 0.2, int rings = 32, int sides = 16) returns Mesh
     return Mesh(nat.ap_mesh_torus(radius, tube, rings, sides))
 end
-# Loads a Wavefront OBJ model.
+# Loads a Wavefront OBJ file as one mesh (load_model keeps its materials, and reads glTF).
 function load_mesh(string path) returns Mesh
     return Mesh(nat.ap_mesh_load(path))
 end
@@ -1038,15 +1038,390 @@ class MeshBuilder
     end
 end
 
-# Draws a mesh at a position. `rotation` is degrees around x, y, and z; `size` scales it.
+# Draws a mesh at a position. `rotation` is degrees around x, y, and z; `size` scales it. A
+# material replaces the texture and lights the mesh physically (see Material).
 function draw(Mesh mesh, Vec3 position, Color tint = WHITE, Vec3 rotation = Vec3(0, 0, 0),
-        Vec3 size = Vec3(1, 1, 1), Texture? texture = null)
-    var image = 0
-    if texture != null do
-        image = texture.id
+        Vec3 size = Vec3(1, 1, 1), Texture? texture = null, Material? material = null)
+    nat.ap_mesh_draw(mesh.id, texture_id(texture), material_id(material), position.x, position.y,
+        position.z, rotation.x, rotation.y, rotation.z, size.x, size.y, size.z, tint.r, tint.g,
+        tint.b, tint.a)
+end
+# Draws a mesh with a material (the same as draw() with the material last).
+function draw_material(Mesh mesh, Material material, Vec3 position,
+        Vec3 rotation = Vec3(0, 0, 0), Vec3 size = Vec3(1, 1, 1), Color tint = WHITE)
+    nat.ap_mesh_draw(mesh.id, 0, material.id, position.x, position.y, position.z, rotation.x,
+        rotation.y, rotation.z, size.x, size.y, size.z, tint.r, tint.g, tint.b, tint.a)
+end
+private function texture_id(Texture? texture) returns int
+    if texture == null do
+        return 0
     end
-    nat.ap_mesh_draw(mesh.id, image, position.x, position.y, position.z, rotation.x, rotation.y,
-        rotation.z, size.x, size.y, size.z, tint.r, tint.g, tint.b, tint.a)
+    return texture.id
+end
+private function material_id(Material? material) returns int
+    if material == null do
+        return 0
+    end
+    return material.id
+end
+# A placement as a matrix, the way draw() places a mesh: scaled by `size`, rotated by
+# `rotation` (degrees around x, then y, then z), then moved to `position`. For draw_many().
+function transform(Vec3 position, Vec3 rotation = Vec3(0, 0, 0),
+        Vec3 size = Vec3(1, 1, 1)) returns Mat4
+    var a = rotation.x * math.PI / 180
+    var b = rotation.y * math.PI / 180
+    var c = rotation.z * math.PI / 180
+    var ca = math.cos(a)
+    var sa = math.sin(a)
+    var cb = math.cos(b)
+    var sb = math.sin(b)
+    var cc = math.cos(c)
+    var sc = math.sin(c)
+    return Mat4(cb * cc * size.x, cb * sc * size.x, -sb * size.x, 0,
+        (sa * sb * cc - ca * sc) * size.y, (sa * sb * sc + ca * cc) * size.y, sa * cb * size.y, 0,
+        (ca * sb * cc + sa * sc) * size.z, (ca * sb * sc - sa * cc) * size.z, ca * cb * size.z, 0,
+        position.x, position.y, position.z, 1)
+end
+# Draws a mesh once for every transform, in one call to the graphics card: a forest, a crowd
+# of rocks, or a swarm of bullets costs about as much as a single draw. `colors`, when it has
+# one color per transform, tints each copy (on top of `tint`).
+#
+#     Mat4[] trees = []
+#     for i in 0..<1000 do
+#         trees.push(ap.transform(Vec3(ap.random(-50, 50), 0, ap.random(-50, 50))))
+#     end
+#     ap.draw_many(tree, trees, bark)
+function draw_many(Mesh mesh, Mat4[] transforms, Material? material = null,
+        Color[] colors = [], Color tint = WHITE, Texture? texture = null)
+    if transforms.length == 0 do
+        return
+    end
+    nat.ap_mesh_draw_many(mesh.id, texture_id(texture), material_id(material), transforms,
+        transforms.length, colors, colors.length, tint.r, tint.g, tint.b, tint.a)
+end
+
+# --- Materials -------------------------------------------------------------------------------
+
+# How a surface takes light, physically based (metallic-roughness, as in glTF): a base color
+# and texture, how metallic and how rough it is, a normal map for fine bumps, light of its own,
+# and ambient occlusion. Drawing with a material lights in linear color with the sun, the
+# point lights, and ambient light.
+#
+#     var gold = ap.Material(ap.hex("#ffc850"), 1, 0.3)
+#     var bricks = ap.Material(ap.WHITE, 0, 0.8, ap.load_texture("bricks.png"))
+#     bricks.normal_map(ap.load_texture("bricks_normal.png"))
+#     ap.draw_material(cube, bricks, Vec3(0, 0.5, 0))
+class Material
+    readonly int id
+    private int session = 0
+    private bool owner = true
+    private int flags = 0
+    # Textures in use, kept alive while the material uses them.
+    private Texture?[] maps = [null, null, null, null, null]
+
+    # `existing` wraps a material a model already has (Model.materials() does this).
+    constructor(Color color = WHITE, double metallic = 0, double roughness = 0.5,
+            Texture? texture = null, int existing = 0)
+        this.id = existing if existing != 0 else nat.ap_material_create()
+        this.owner = existing == 0
+        this.session = nat.ap_session()
+        if this.owner do
+            this.color(color)
+            this.surface(metallic, roughness)
+            if texture != null do
+                this.texture(texture)
+            end
+        end
+    end
+    destructor
+        this.free()
+    end
+    function free()
+        if this.owner and this.session != 0 and this.session == nat.ap_session() do
+            nat.ap_material_free(this.id)
+        end
+        this.session = 0
+    end
+    # The base color, multiplied with the texture.
+    function color(Color color)
+        nat.ap_material_color(this.id, color.r, color.g, color.b, color.a)
+    end
+    # `metallic` 0 (plastic, wood, stone) to 1 (bare metal); `roughness` 0 (mirror-smooth) to
+    # 1 (chalk).
+    function surface(double metallic, double roughness)
+        nat.ap_material_surface(this.id, metallic, roughness)
+    end
+    private function map(int slot, Texture? texture)
+        this.maps[slot] = texture
+        nat.ap_material_map(this.id, slot, texture_id(texture))
+    end
+    # The base color texture.
+    function texture(Texture? texture)
+        this.map(0, texture)
+    end
+    # A tangent-space normal map (OpenGL style, green up), bent `strength` times as much as
+    # painted.
+    function normal_map(Texture? texture, double strength = 1)
+        this.map(1, texture)
+        nat.ap_material_normal_scale(this.id, strength)
+    end
+    # Metallic in the blue channel and roughness in the green one (glTF's layout); they
+    # multiply the values of surface().
+    function surface_map(Texture? texture)
+        this.map(2, texture)
+    end
+    # Light the surface gives off by itself: screens, lava, eyes in the dark.
+    function glow(Color color, double strength = 1)
+        nat.ap_material_emissive(this.id, color.r, color.g, color.b, strength)
+    end
+    # Where it glows (multiplying glow()).
+    function glow_map(Texture? texture)
+        this.map(3, texture)
+    end
+    # How much ambient light reaches each point (red channel), darkening creases.
+    function occlusion_map(Texture? texture)
+        this.map(4, texture)
+    end
+    # Pixels less opaque than `cutoff` are not drawn at all: leaves, grass, fences. 0 turns it
+    # off.
+    function cutoff(double cutoff)
+        nat.ap_material_cutoff(this.id, cutoff)
+    end
+    # Whether the back of each face is drawn too (leaves, cloth, paper).
+    function two_sided(bool on)
+        this.set_flag(1, on)
+    end
+    # Whether the material is see-through (glass, water): it blends with what is behind it
+    # without hiding it. Draw these after everything opaque.
+    function transparent(bool on)
+        this.set_flag(2, on)
+    end
+    # Whether lights are ignored, showing the color as it is.
+    function unlit(bool on)
+        this.set_flag(4, on)
+    end
+    private function set_flag(int bit, bool on)
+        var has = this.flags % (bit * 2) >= bit
+        if on and not has do
+            this.flags += bit
+        else if has and not on do
+            this.flags -= bit
+        end
+        nat.ap_material_options(this.id, this.flags)
+    end
+end
+
+# --- Models ----------------------------------------------------------------------------------
+
+# A model from a file: meshes with their materials and textures, arranged in a tree of nodes,
+# and for glTF its skeletons and animations. Freed when no longer referenced, or by close().
+#
+#     var hero = ap.load_model("hero.glb")
+#     ...
+#     hero.play("Run", ap.time())
+#     ap.draw_model(hero, Vec3(0, 0, 0), ap.WHITE, Vec3(0, heading, 0))
+class Model
+    readonly int id
+    private int session = 0
+
+    constructor(int id)
+        this.id = id
+        this.session = nat.ap_session()
+    end
+    destructor
+        this.free()
+    end
+    function free()
+        if this.session != 0 and this.session == nat.ap_session() do
+            nat.ap_model_free(this.id)
+        end
+        this.session = 0
+    end
+    function triangles() returns int
+        return nat.ap_model_triangles(this.id)
+    end
+    # The corners of the box around the model as loaded.
+    function low() returns Vec3
+        nat.ap_model_bounds(this.id)
+        return Vec3(nat.ap_result(0), nat.ap_result(1), nat.ap_result(2))
+    end
+    function high() returns Vec3
+        nat.ap_model_bounds(this.id)
+        return Vec3(nat.ap_result(3), nat.ap_result(4), nat.ap_result(5))
+    end
+    function size() returns Vec3
+        return this.high() - this.low()
+    end
+    # The model's materials, to change; changes show wherever the model is drawn.
+    function materials() returns Material[]
+        Material[] found = []
+        for i in 0..<nat.ap_model_material_count(this.id) do
+            found.push(Material(WHITE, 0, 0.5, null, nat.ap_model_material(this.id, i)))
+        end
+        return found
+    end
+
+    # The names of its animations.
+    function animations() returns string[]
+        string[] names = []
+        for i in 0..<nat.ap_model_clip_count(this.id) do
+            names.push(nat.ap_model_clip_name(this.id, i))
+        end
+        return names
+    end
+    function has_animation(string name) returns bool
+        return nat.ap_model_clip_find(this.id, name) >= 0
+    end
+    # How long an animation lasts, in seconds.
+    function length(string name) returns double
+        return nat.ap_model_clip_length(this.id, this.clip(name))
+    end
+    private function clip(string name) returns int
+        var index = nat.ap_model_clip_find(this.id, name)
+        if index < 0 do
+            throw ValueError("the model has no animation '" + name + "' (it has " +
+                ", ".join(this.animations()) + ")")
+        end
+        return index
+    end
+    # Poses the model as an animation is `time` seconds in, repeating when `loop`. The pose
+    # stays until the next play(), and is what draw_model() shows: to draw one model in several
+    # poses, play() before each draw.
+    function play(string name, double time, bool loop = true)
+        nat.ap_model_reset(this.id)
+        nat.ap_model_animate(this.id, this.clip(name), time, 1, loop)
+    end
+    # Mixes another animation into the current pose by `weight` (0 to 1): crossfades from
+    # walking to running, or a wave on top of an idle pose.
+    #
+    #     hero.play("Walk", t)
+    #     hero.blend("Run", t, speed / max_speed)
+    function blend(string name, double time, double weight, bool loop = true)
+        nat.ap_model_animate(this.id, this.clip(name), time, weight, loop)
+    end
+    # Back to the pose it was loaded in.
+    function rest()
+        nat.ap_model_reset(this.id)
+    end
+
+    # The names of its nodes (the parts and bones of the tree).
+    function nodes() returns string[]
+        string[] names = []
+        for i in 0..<nat.ap_model_node_count(this.id) do
+            names.push(nat.ap_model_node_name(this.id, i))
+        end
+        return names
+    end
+    private function node(string name) returns int
+        var index = nat.ap_model_node_find(this.id, name)
+        if index < 0 do
+            throw ValueError("the model has no node '" + name + "'")
+        end
+        return index
+    end
+    # Where a node is in the model's own space, in the current pose: attach a sword to a hand
+    # by drawing it at transform * node_transform("hand").
+    function node_transform(string name) returns Mat4
+        nat.ap_model_node_world(this.id, this.node(name))
+        return Mat4(nat.ap_result(0), nat.ap_result(1), nat.ap_result(2), nat.ap_result(3),
+            nat.ap_result(4), nat.ap_result(5), nat.ap_result(6), nat.ap_result(7),
+            nat.ap_result(8), nat.ap_result(9), nat.ap_result(10), nat.ap_result(11),
+            nat.ap_result(12), nat.ap_result(13), nat.ap_result(14), nat.ap_result(15))
+    end
+    function node_position(string name) returns Vec3
+        nat.ap_model_node_world(this.id, this.node(name))
+        return Vec3(nat.ap_result(12), nat.ap_result(13), nat.ap_result(14))
+    end
+    # A node's rotation relative to its parent, in the current pose.
+    function node_rotation(string name) returns Quat
+        nat.ap_model_node_local(this.id, this.node(name))
+        return Quat(nat.ap_result(3), nat.ap_result(4), nat.ap_result(5), nat.ap_result(6))
+    end
+    # Turns a node relative to its parent, keeping its place and scale: a head that looks at
+    # the player, a turret that aims. Call after play().
+    function turn_node(string name, Quat rotation)
+        var index = this.node(name)
+        nat.ap_model_node_local(this.id, index)
+        nat.ap_model_node_set(this.id, index, nat.ap_result(0), nat.ap_result(1),
+            nat.ap_result(2), rotation.x, rotation.y, rotation.z, rotation.w, nat.ap_result(7),
+            nat.ap_result(8), nat.ap_result(9))
+    end
+    # Moves a node relative to its parent, keeping its rotation and scale.
+    function move_node(string name, Vec3 position)
+        var index = this.node(name)
+        nat.ap_model_node_local(this.id, index)
+        nat.ap_model_node_set(this.id, index, position.x, position.y, position.z,
+            nat.ap_result(3), nat.ap_result(4), nat.ap_result(5), nat.ap_result(6),
+            nat.ap_result(7), nat.ap_result(8), nat.ap_result(9))
+    end
+end
+# Loads a glTF 2.0 model (.gltf with its files, or a single .glb) or a Wavefront OBJ model
+# with its MTL materials. Images in PNG, JPEG, BMP, and TGA are read.
+function load_model(string path) returns Model
+    return Model(nat.ap_model_load(path))
+end
+# Draws a model in its current pose, like draw() draws a mesh. A material replaces all of the
+# model's own.
+function draw_model(Model model, Vec3 position, Color tint = WHITE,
+        Vec3 rotation = Vec3(0, 0, 0), Vec3 size = Vec3(1, 1, 1), Material? material = null)
+    nat.ap_model_draw(model.id, material_id(material), position.x, position.y, position.z,
+        rotation.x, rotation.y, rotation.z, size.x, size.y, size.z, tint.r, tint.g, tint.b,
+        tint.a)
+end
+# Draws a model once for every transform in one call, like draw_many() (all in the same pose).
+function draw_model_many(Model model, Mat4[] transforms, Color[] colors = [],
+        Color tint = WHITE, Material? material = null)
+    if transforms.length == 0 do
+        return
+    end
+    nat.ap_model_draw_many(model.id, material_id(material), transforms, transforms.length,
+        colors, colors.length, tint.r, tint.g, tint.b, tint.a)
+end
+
+# --- Shadows ---------------------------------------------------------------------------------
+
+# Shadows cast by the sun. `resolution` is the shadow map's size in pixels (sharper when
+# larger), `strength` how dark shadows are (0 to 1).
+function shadows(bool on, int resolution = 2048, double strength = 0.75)
+    nat.ap_shadows(on, resolution, strength)
+end
+function shadows_on() returns bool
+    return nat.ap_shadows_on()
+end
+# Draws what casts shadows, seen from the sun, until end_shadows(). Shadows fall within
+# `radius` of `center`; a smaller area gives sharper shadows. 3D drawing for the rest of the
+# frame is shadowed. scene_3d() does this for you.
+function begin_shadows(Vec3 center, double radius = 20)
+    nat.ap_shadow_begin(center.x, center.y, center.z, radius)
+end
+function end_shadows()
+    nat.ap_shadow_end()
+end
+# Whether drawing is going into the shadow map (inside begin_shadows), so a scene function
+# can skip things that cast no shadow, such as the ground.
+function casting_shadows() returns bool
+    return nat.ap_shadow_casting()
+end
+# Draws a 3D scene through a camera, with shadows when they are on: `scene` runs once for the
+# shadow map (around the camera's target, `shadow_radius` far) and once for the picture.
+#
+#     ap.shadows(true)
+#     while ap.frame() do
+#         ap.clear(ap.SKY)
+#         ap.scene_3d(camera, function()
+#             ap.draw(ground, Vec3(0, 0, 0))
+#             ap.draw_model(hero, hero_position)
+#         end)
+#     end
+function scene_3d(Camera3D camera, function() scene, double shadow_radius = 20)
+    if nat.ap_shadows_on() do
+        nat.ap_shadow_begin(camera.target.x, camera.target.y, camera.target.z, shadow_radius)
+        scene()
+        nat.ap_shadow_end()
+    end
+    begin_3d(camera)
+    scene()
+    end_3d()
 end
 # Transforms apply to everything drawn in 3D until the matching pop_3d().
 function push_3d()

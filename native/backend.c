@@ -12,6 +12,7 @@
 #define _USE_MATH_DEFINES
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_opengl.h>
+#include <ctype.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -25,6 +26,25 @@
 #endif
 
 #include "font5x7.h"
+
+#define STB_IMAGE_IMPLEMENTATION
+#define STB_IMAGE_STATIC
+#define STBI_ONLY_PNG
+#define STBI_ONLY_JPEG
+#define STBI_ONLY_BMP
+#define STBI_ONLY_TGA
+#define STBI_FAILURE_USERMSG
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#pragma GCC diagnostic ignored "-Wsign-compare"
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+#endif
+#include "stb_image.h"
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
+
 
 void fw_foreign_fail(const char *message);
 
@@ -63,7 +83,9 @@ void fw_foreign_fail(const char *message);
     F(void, DepthMask, (GLboolean))                                                                \
     F(void, Disable, (GLenum))                                                                     \
     F(void, DrawArrays, (GLenum, GLint, GLsizei))                                                  \
+    F(void, DrawBuffer, (GLenum))                                                                  \
     F(void, DrawElements, (GLenum, GLsizei, GLenum, const void *))                                 \
+    F(void, DrawElementsInstanced, (GLenum, GLsizei, GLenum, const void *, GLsizei))               \
     F(void, Enable, (GLenum))                                                                      \
     F(void, EnableVertexAttribArray, (GLuint))                                                     \
     F(void, FramebufferRenderbuffer, (GLenum, GLenum, GLenum, GLuint))                             \
@@ -82,12 +104,15 @@ void fw_foreign_fail(const char *message);
     F(void, LinkProgram, (GLuint))                                                                 \
     F(void, PixelStorei, (GLenum, GLint))                                                          \
     F(void, PolygonMode, (GLenum, GLenum))                                                         \
+    F(void, PolygonOffset, (GLfloat, GLfloat))                                                     \
+    F(void, ReadBuffer, (GLenum))                                                                  \
     F(void, ReadPixels, (GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void *))                  \
     F(void, RenderbufferStorage, (GLenum, GLenum, GLsizei, GLsizei))                               \
     F(void, Scissor, (GLint, GLint, GLsizei, GLsizei))                                             \
     F(void, ShaderSource, (GLuint, GLsizei, const char *const *, const GLint *))                   \
     F(void, TexImage2D,                                                                            \
       (GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *))               \
+    F(void, TexParameterfv, (GLenum, GLenum, const GLfloat *))                                     \
     F(void, TexParameteri, (GLenum, GLenum, GLint))                                                \
     F(void, TexSubImage2D,                                                                         \
       (GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, const void *))               \
@@ -101,6 +126,8 @@ void fw_foreign_fail(const char *message);
     F(void, UniformMatrix3fv, (GLint, GLsizei, GLboolean, const GLfloat *))                        \
     F(void, UniformMatrix4fv, (GLint, GLsizei, GLboolean, const GLfloat *))                        \
     F(void, UseProgram, (GLuint))                                                                  \
+    F(void, VertexAttribDivisor, (GLuint, GLuint))                                                 \
+    F(void, VertexAttribIPointer, (GLuint, GLint, GLenum, GLsizei, const void *))                  \
     F(void, VertexAttribPointer, (GLuint, GLint, GLenum, GLboolean, GLsizei, const void *))        \
     F(void, Viewport, (GLint, GLint, GLsizei, GLsizei))
 
@@ -112,9 +139,14 @@ typedef struct {
     float x, y, u, v;
     unsigned char r, g, b, a;
 } Vertex2;
+/* tangent: xyz along +u, w the handedness of the bitangent; joints and weights skin a vertex
+   to up to four bones of a skeleton (all weights zero leaves it unskinned). */
 typedef struct {
     float x, y, z, nx, ny, nz, u, v;
     unsigned char r, g, b, a;
+    float tx, ty, tz, tw;
+    unsigned short joints[4];
+    float weights[4];
 } Vertex3;
 typedef struct {
     GLuint id;
@@ -136,7 +168,19 @@ typedef struct {
     GLuint vao, vbo, ebo;
     int index_count, vertex_count;
     float radius; /* of the bounding sphere around the origin */
+    float low[3], high[3];
+    bool skinned;
 } Mesh;
+/* A surface: PBR metallic-roughness, as in glTF. Colors are linear. Textures are ids in
+   A.textures (0 for none); `owned` ones are freed with the material. */
+enum { MAP_BASE, MAP_NORMAL, MAP_METAL_ROUGH, MAP_EMISSIVE, MAP_OCCLUSION, MAP_COUNT };
+typedef struct {
+    bool used, unlit, double_sided, blend;
+    float color[4], emissive[3];
+    float metallic, roughness, normal_scale, occlusion_strength, alpha_cutoff;
+    int maps[MAP_COUNT];
+    bool owned[MAP_COUNT];
+} Material;
 typedef struct {
     bool used;
     GLuint framebuffer, depth;
@@ -158,9 +202,28 @@ typedef struct {
     bool looping;
 } Voice;
 
+/* Uniforms of the 3D programs, looked up by name once per program. */
+#define AP_UNIFORMS(F)                                                                             \
+    F(model) F(stack) F(viewproj) F(normal) F(instanced) F(skinned) F(joints) F(light_viewproj)   \
+    F(shadow_offset) F(texture) F(tint) F(lit) F(ambient) F(sun_direction) F(sun_color)           \
+    F(light_count) F(light_position) F(light_color) F(eye) F(shininess) F(specular) F(fog_color)  \
+    F(fog_range) F(pbr) F(metallic) F(roughness) F(emissive) F(normal_map) F(normal_scale)        \
+    F(has_normal_map) F(metal_rough) F(emissive_map) F(occlusion_map) F(occlusion_strength)       \
+    F(alpha_cutoff) F(shadow_map) F(shadows) F(shadow_strength) F(shadow_texel)
+#define AP_UNIFORM_ENUM(name) U_##name,
+enum { AP_UNIFORMS(AP_UNIFORM_ENUM) U_COUNT };
+typedef struct {
+    GLuint id;
+    GLint u[U_COUNT];
+} Program3;
+struct Model;
+
 #define AP_MAX_TEXTURES 1024
 #define AP_MAX_FONTS 64
-#define AP_MAX_MESHES 1024
+#define AP_MAX_MESHES 4096
+#define AP_MAX_MATERIALS 1024
+#define AP_MAX_MODELS 256
+#define AP_MAX_JOINTS 256
 #define AP_MAX_CANVASES 64
 #define AP_MAX_SHADERS 64
 #define AP_MAX_SOUNDS 256
@@ -206,12 +269,18 @@ static struct {
     float polygon[256][2];
     int polygon_count;
     /* 3D */
-    bool in3d, lighting, wireframe;
-    GLuint program3, vao3, vbo3;
-    GLint u_model, u_viewproj, u_normal, u_texture3, u_tint, u_lit, u_ambient, u_sun_direction,
-        u_sun_color, u_light_count, u_light_position, u_light_color, u_eye, u_shininess,
-        u_specular, u_fog_color, u_fog_range;
+    bool in3d, lighting, wireframe, culling, depth_writing;
+    Program3 lit3, depth3; /* the 3D shader, and the one that draws into the shadow map */
+    GLuint vao3, vbo3;
+    GLuint instance_vbo, joint_texture;
+    int instance_capacity;
+    float *instance_data;
     float view[16], proj3[16], viewproj[16], eye[3];
+    /* shadows of the sun */
+    bool shadows, shadow_pass, shadow_ready;
+    int shadow_size;
+    GLuint shadow_fbo, shadow_depth;
+    float shadow_viewproj[16], shadow_strength, shadow_offset;
     float model[AP_STACK_DEPTH][16];
     int model_depth;
     float ambient[3], sun_direction[3], sun_color[3];
@@ -228,6 +297,7 @@ static struct {
     unsigned *build_indices;
     int build_vertex_count, build_vertex_capacity, build_index_count, build_index_capacity;
     unsigned char build_color[4];
+    bool build_tangents; /* the loader gave tangents; otherwise ap_mesh_end computes them */
     /* pixel buffer under construction */
     unsigned char *pixels;
     int pixels_w, pixels_h;
@@ -235,6 +305,8 @@ static struct {
     Texture textures[AP_MAX_TEXTURES];
     Font fonts[AP_MAX_FONTS];
     Mesh meshes[AP_MAX_MESHES];
+    Material materials[AP_MAX_MATERIALS];
+    struct Model *models[AP_MAX_MODELS];
     Canvas canvases[AP_MAX_CANVASES];
     Shader shaders[AP_MAX_SHADERS];
     Sound sounds[AP_MAX_SOUNDS];
@@ -242,7 +314,7 @@ static struct {
     int canvas; /* the render target being drawn to, or 0 */
     SDL_AudioDeviceID audio;
     float master_volume;
-    float result[8]; /* values returned by ap_project and ap_screen_ray */
+    float result[16]; /* values returned by ap_project, ap_screen_ray, and node transforms */
 } A;
 
 /* Counts windows opened, so handles from an earlier window are never freed in a later one. */
@@ -418,48 +490,159 @@ static const char *fragment2_header =
 static const char *fragment2_default =
     "vec4 effect(vec4 color, sampler2D image, vec2 uv) { return texture(image, uv) * color; }\n";
 static const char *fragment2_main = "void main() { o_color = effect(v_color, u_texture, v_uv); }\n";
+/* One vertex shader for every 3D draw: plain, skinned (joint matrices in a float texture, four
+   texels a joint), and instanced (a model matrix and a color per instance). */
 static const char *vertex3_source =
     "#version 330 core\n"
     "layout(location = 0) in vec3 a_position;\n"
     "layout(location = 1) in vec3 a_normal;\n"
     "layout(location = 2) in vec2 a_uv;\n"
     "layout(location = 3) in vec4 a_color;\n"
-    "uniform mat4 u_model;\nuniform mat4 u_viewproj;\nuniform mat3 u_normal;\n"
-    "out vec3 v_world;\nout vec3 v_normal;\nout vec2 v_uv;\nout vec4 v_color;\n"
+    "layout(location = 4) in vec4 a_tangent;\n"
+    "layout(location = 5) in uvec4 a_joints;\n"
+    "layout(location = 6) in vec4 a_weights;\n"
+    "layout(location = 7) in mat4 a_instance;\n"
+    "layout(location = 11) in vec4 a_instance_color;\n"
+    "uniform mat4 u_model;\nuniform mat4 u_stack;\nuniform mat4 u_viewproj;\n"
+    "uniform mat3 u_normal;\nuniform int u_instanced;\nuniform int u_skinned;\n"
+    "uniform sampler2D u_joints;\nuniform mat4 u_light_viewproj;\nuniform float u_shadow_offset;\n"
+    "out vec3 v_world;\nout vec3 v_normal;\nout vec4 v_tangent;\nout vec2 v_uv;\n"
+    "out vec4 v_color;\nout vec4 v_shadow;\n"
+    "mat4 joint(uint j) {\n"
+    "    int x = int(j) * 4;\n"
+    "    return mat4(texelFetch(u_joints, ivec2(x, 0), 0), texelFetch(u_joints, ivec2(x + 1, 0), 0),\n"
+    "                texelFetch(u_joints, ivec2(x + 2, 0), 0), texelFetch(u_joints, ivec2(x + 3, 0), 0));\n"
+    "}\n"
     "void main() {\n"
-    "    vec4 world = u_model * vec4(a_position, 1.0);\n"
+    "    vec4 position = vec4(a_position, 1.0);\n"
+    "    vec3 normal = a_normal, tangent = a_tangent.xyz;\n"
+    "    if (u_skinned != 0) {\n"
+    "        mat4 skin = a_weights.x * joint(a_joints.x) + a_weights.y * joint(a_joints.y) +\n"
+    "                    a_weights.z * joint(a_joints.z) + a_weights.w * joint(a_joints.w);\n"
+    "        position = skin * position;\n"
+    "        normal = mat3(skin) * normal;\n"
+    "        tangent = mat3(skin) * tangent;\n"
+    "    }\n"
+    "    mat4 model = u_model;\n"
+    "    mat3 normal_matrix = u_normal;\n"
+    "    v_color = a_color;\n"
+    "    if (u_instanced != 0) {\n"
+    "        model = u_stack * a_instance * u_model;\n"
+    "        normal_matrix = transpose(inverse(mat3(model)));\n"
+    "        v_color *= a_instance_color;\n"
+    "    }\n"
+    "    vec4 world = model * position;\n"
     "    v_world = world.xyz;\n"
-    "    v_normal = u_normal * a_normal;\n"
-    "    v_uv = a_uv;\n    v_color = a_color;\n"
+    "    v_normal = normal_matrix * normal;\n"
+    "    v_tangent = vec4(mat3(model) * tangent, a_tangent.w);\n"
+    "    v_uv = a_uv;\n"
+    "    float n = length(v_normal);\n"
+    "    vec3 offset = n > 0.0 ? v_normal / n * u_shadow_offset : vec3(0.0);\n"
+    "    v_shadow = u_light_viewproj * vec4(world.xyz + offset, 1.0);\n"
     "    gl_Position = u_viewproj * world;\n"
     "}\n";
+/* Lighting: the original Blinn-Phong for plain draws, or PBR metallic-roughness (computed in
+   linear light) for draws with a material. The sun casts shadows through the shadow map. */
 static const char *fragment3_source =
     "#version 330 core\n"
-    "in vec3 v_world;\nin vec3 v_normal;\nin vec2 v_uv;\nin vec4 v_color;\n"
-    "uniform sampler2D u_texture;\n"
+    "in vec3 v_world;\nin vec3 v_normal;\nin vec4 v_tangent;\nin vec2 v_uv;\nin vec4 v_color;\n"
+    "in vec4 v_shadow;\n"
+    "uniform sampler2D u_texture;\nuniform sampler2D u_normal_map;\n"
+    "uniform sampler2D u_metal_rough;\nuniform sampler2D u_emissive_map;\n"
+    "uniform sampler2D u_occlusion_map;\nuniform sampler2DShadow u_shadow_map;\n"
     "uniform vec4 u_tint;\n"
-    "uniform int u_lit;\n"
+    "uniform int u_lit;\nuniform int u_pbr;\nuniform int u_has_normal_map;\nuniform int u_shadows;\n"
     "uniform vec3 u_ambient;\nuniform vec3 u_sun_direction;\nuniform vec3 u_sun_color;\n"
     "uniform int u_light_count;\n"
     "uniform vec4 u_light_position[8];\nuniform vec3 u_light_color[8];\n"
     "uniform vec3 u_eye;\nuniform float u_shininess;\nuniform float u_specular;\n"
     "uniform vec3 u_fog_color;\nuniform vec2 u_fog_range;\n"
+    "uniform float u_metallic;\nuniform float u_roughness;\nuniform vec3 u_emissive;\n"
+    "uniform float u_normal_scale;\nuniform float u_occlusion_strength;\n"
+    "uniform float u_alpha_cutoff;\nuniform float u_shadow_strength;\nuniform vec2 u_shadow_texel;\n"
     "out vec4 o_color;\n"
+    "const float PI = 3.14159265;\n"
+    "vec3 linear(vec3 c) { return pow(max(c, 0.0), vec3(2.2)); }\n"
+    "float sunlit() {\n"
+    "    if (u_shadows == 0) return 1.0;\n"
+    "    vec3 p = v_shadow.xyz / v_shadow.w * 0.5 + 0.5;\n"
+    "    if (p.x <= 0.0 || p.x >= 1.0 || p.y <= 0.0 || p.y >= 1.0 || p.z >= 1.0) return 1.0;\n"
+    "    float lit = 0.0;\n"
+    "    for (int x = -1; x <= 1; x++)\n"
+    "        for (int y = -1; y <= 1; y++)\n"
+    "            lit += texture(u_shadow_map, vec3(p.xy + vec2(x, y) * u_shadow_texel, p.z - 0.0005));\n"
+    "    return mix(1.0, lit / 9.0, u_shadow_strength);\n"
+    "}\n"
+    "vec3 surface_normal() {\n"
+    "    vec3 n = normalize(v_normal);\n"
+    "    if (!gl_FrontFacing) n = -n;\n"
+    "    if (u_has_normal_map != 0 && dot(v_tangent.xyz, v_tangent.xyz) > 1e-10) {\n"
+    "        vec3 t = normalize(v_tangent.xyz - n * dot(n, v_tangent.xyz));\n"
+    "        vec3 b = cross(n, t) * (v_tangent.w < 0.0 ? -1.0 : 1.0);\n"
+    "        vec3 m = texture(u_normal_map, v_uv).xyz * 2.0 - 1.0;\n"
+    "        m.xy *= u_normal_scale;\n"
+    "        n = normalize(mat3(t, b, n) * m);\n"
+    "    }\n"
+    "    return n;\n"
+    "}\n"
+    "vec3 brdf(vec3 n, vec3 v, vec3 l, vec3 albedo, float metal, float rough, vec3 radiance) {\n"
+    "    float nl = dot(n, l);\n"
+    "    if (nl <= 0.0) return vec3(0.0);\n"
+    "    vec3 h = normalize(v + l);\n"
+    "    float nv = max(dot(n, v), 1e-4), nh = max(dot(n, h), 0.0), vh = max(dot(v, h), 0.0);\n"
+    "    float a = rough * rough, a2 = a * a;\n"
+    "    float d = nh * nh * (a2 - 1.0) + 1.0;\n"
+    "    float D = a2 / (PI * d * d);\n"
+    "    float k = (rough + 1.0) * (rough + 1.0) / 8.0;\n"
+    "    float G = nv / (nv * (1.0 - k) + k) * nl / (nl * (1.0 - k) + k);\n"
+    "    vec3 f0 = mix(vec3(0.04), albedo, metal);\n"
+    "    vec3 F = f0 + (1.0 - f0) * pow(1.0 - vh, 5.0);\n"
+    "    vec3 specular = D * G * F / max(4.0 * nv * nl, 1e-4);\n"
+    "    vec3 diffuse = (1.0 - F) * (1.0 - metal) * albedo / PI;\n"
+    "    return (diffuse + specular) * radiance * nl;\n"
+    "}\n"
     "void main() {\n"
     "    vec4 base = texture(u_texture, v_uv) * v_color * u_tint;\n"
-    "    if (base.a < 0.004) discard;\n"
+    "    if (base.a < max(u_alpha_cutoff, 0.004)) discard;\n"
     "    vec3 color = base.rgb;\n"
-    "    if (u_lit != 0) {\n"
-    "        vec3 n = normalize(v_normal);\n"
-    "        if (!gl_FrontFacing) n = -n;\n"
+    "    if (u_pbr != 0) {\n"
+    "        vec3 albedo = linear(base.rgb);\n"
+    "        color = albedo;\n"
+    "        if (u_lit != 0) {\n"
+    "            vec4 mr = texture(u_metal_rough, v_uv);\n"
+    "            float rough = clamp(u_roughness * mr.g, 0.04, 1.0);\n"
+    "            float metal = clamp(u_metallic * mr.b, 0.0, 1.0);\n"
+    "            vec3 n = surface_normal();\n"
+    "            vec3 v = normalize(u_eye - v_world);\n"
+    "            float occlusion = mix(1.0, texture(u_occlusion_map, v_uv).r, u_occlusion_strength);\n"
+    "            /* no environment map: metals reflect the ambient light and some sky */\n"
+    "            vec3 f0 = mix(vec3(0.04), albedo, metal);\n"
+    "            vec3 sky = linear(u_ambient) + linear(u_sun_color) * 0.25;\n"
+    "            color = (linear(u_ambient) * albedo * (1.0 - metal) + sky * f0 * (1.0 - rough * 0.5)) *\n"
+    "                    occlusion;\n"
+    "            color += brdf(n, v, normalize(-u_sun_direction), albedo, metal, rough,\n"
+    "                          linear(u_sun_color) * PI) * sunlit();\n"
+    "            for (int i = 0; i < u_light_count; i++) {\n"
+    "                vec3 delta = u_light_position[i].xyz - v_world;\n"
+    "                float distance = length(delta);\n"
+    "                float reach = clamp(1.0 - distance / u_light_position[i].w, 0.0, 1.0);\n"
+    "                color += brdf(n, v, delta / max(distance, 0.0001), albedo, metal, rough,\n"
+    "                              linear(u_light_color[i]) * PI * reach * reach);\n"
+    "            }\n"
+    "        }\n"
+    "        color += u_emissive * linear(texture(u_emissive_map, v_uv).rgb);\n"
+    "        color = pow(max(color, 0.0), vec3(1.0 / 2.2));\n"
+    "    } else if (u_lit != 0) {\n"
+    "        vec3 n = surface_normal();\n"
     "        vec3 to_eye = normalize(u_eye - v_world);\n"
     "        vec3 light = u_ambient;\n"
     "        vec3 shine = vec3(0.0);\n"
     "        vec3 l = normalize(-u_sun_direction);\n"
     "        float d = max(dot(n, l), 0.0);\n"
-    "        light += u_sun_color * d;\n"
+    "        float sun = d > 0.0 ? sunlit() : 1.0;\n"
+    "        light += u_sun_color * d * sun;\n"
     "        if (d > 0.0 && u_specular > 0.0)\n"
-    "            shine += u_sun_color * pow(max(dot(n, normalize(l + to_eye)), 0.0), u_shininess);\n"
+    "            shine += u_sun_color * sun * pow(max(dot(n, normalize(l + to_eye)), 0.0), u_shininess);\n"
     "        for (int i = 0; i < u_light_count; i++) {\n"
     "            vec3 delta = u_light_position[i].xyz - v_world;\n"
     "            float distance = length(delta);\n"
@@ -480,6 +663,15 @@ static const char *fragment3_source =
     "        color = mix(color, u_fog_color, fog);\n"
     "    }\n"
     "    o_color = vec4(color, base.a);\n"
+    "}\n";
+/* The shadow pass only writes depth; cut-out (alpha tested) surfaces leave holes. */
+static const char *depth3_source =
+    "#version 330 core\n"
+    "in vec2 v_uv;\nin vec4 v_color;\n"
+    "uniform sampler2D u_texture;\nuniform vec4 u_tint;\nuniform float u_alpha_cutoff;\n"
+    "void main() {\n"
+    "    float a = texture(u_texture, v_uv).a * v_color.a * u_tint.a;\n"
+    "    if (a < (u_alpha_cutoff > 0.0 ? u_alpha_cutoff : 0.1)) discard;\n"
     "}\n";
 
 static GLuint compile(GLenum kind, const char **parts, int count, char *log, int log_size) {
@@ -668,6 +860,40 @@ static void set_target(void) {
     m4_ortho(A.projection, 0, A.logical_w, A.logical_h, 0, -1, 1);
 }
 
+/* --- 3D vertex layout ---------------------------------------------------------------------- */
+static void lookup_uniforms(Program3 *p) {
+#define AP_UNIFORM_LOOKUP(name) p->u[U_##name] = glGetUniformLocation_(p->id, "u_" #name);
+    AP_UNIFORMS(AP_UNIFORM_LOOKUP)
+}
+/* Attributes 0 to 6 of Vertex3, from the bound array buffer, into the bound vertex array. */
+static void vertex3_layout(void) {
+    for (int i = 0; i < 7; i++)
+        glEnableVertexAttribArray_(i);
+    glVertexAttribPointer_(0, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex3), (void *)0);
+    glVertexAttribPointer_(1, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex3),
+                           (void *)offsetof(Vertex3, nx));
+    glVertexAttribPointer_(2, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex3),
+                           (void *)offsetof(Vertex3, u));
+    glVertexAttribPointer_(3, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(Vertex3),
+                           (void *)offsetof(Vertex3, r));
+    glVertexAttribPointer_(4, 4, GL_FLOAT, GL_FALSE, sizeof(Vertex3),
+                           (void *)offsetof(Vertex3, tx));
+    glVertexAttribIPointer_(5, 4, GL_UNSIGNED_SHORT, sizeof(Vertex3),
+                            (void *)offsetof(Vertex3, joints));
+    glVertexAttribPointer_(6, 4, GL_FLOAT, GL_FALSE, sizeof(Vertex3),
+                           (void *)offsetof(Vertex3, weights));
+}
+/* Attributes 7 to 11 (a model matrix and a color per instance) from the instance buffer. */
+static void instance_layout(void) {
+    glBindBuffer_(GL_ARRAY_BUFFER, A.instance_vbo);
+    for (int i = 0; i < 5; i++) {
+        glEnableVertexAttribArray_(7 + i);
+        glVertexAttribPointer_(7 + i, 4, GL_FLOAT, GL_FALSE, 20 * sizeof(float),
+                               (void *)(i * 4 * sizeof(float)));
+        glVertexAttribDivisor_(7 + i, 1);
+    }
+}
+
 /* --- Window and frames --------------------------------------------------------------------- */
 static void refresh_size(void) {
     SDL_GetWindowSize(A.window, &A.width, &A.height);
@@ -679,6 +905,7 @@ static void refresh_size(void) {
 }
 static void audio_close(void);
 static void build_font(void);
+static void model_release(struct Model *model);
 
 /* flags: 1 resizable, 2 fullscreen, 4 no vsync, 8 hidden (for tests and tools), 16 4x
    multisampling, 32 borderless. */
@@ -754,8 +981,10 @@ void ap_open(const char *title, long width, long height, long flags) {
     A.program2 = program(vertex, 1, fragment, 3, log, sizeof log);
     const char *vertex3[] = {vertex3_source};
     const char *fragment3[] = {fragment3_source};
-    A.program3 = A.program2 ? program(vertex3, 1, fragment3, 1, log, sizeof log) : 0;
-    if (!A.program2 || !A.program3) {
+    const char *depth3[] = {depth3_source};
+    A.lit3.id = A.program2 ? program(vertex3, 1, fragment3, 1, log, sizeof log) : 0;
+    A.depth3.id = A.lit3.id ? program(vertex3, 1, depth3, 1, log, sizeof log) : 0;
+    if (!A.program2 || !A.lit3.id || !A.depth3.id) {
         fail("cannot build the built-in shaders: %s", log);
         A.open = false;
         SDL_GL_DestroyContext(context);
@@ -767,24 +996,8 @@ void ap_open(const char *title, long width, long height, long flags) {
     A.texture2 = glGetUniformLocation_(A.program2, "u_texture");
     A.time2 = glGetUniformLocation_(A.program2, "u_time");
     A.resolution2 = glGetUniformLocation_(A.program2, "u_resolution");
-#define AP_UNIFORM(field, name) A.field = glGetUniformLocation_(A.program3, name)
-    AP_UNIFORM(u_model, "u_model");
-    AP_UNIFORM(u_viewproj, "u_viewproj");
-    AP_UNIFORM(u_normal, "u_normal");
-    AP_UNIFORM(u_texture3, "u_texture");
-    AP_UNIFORM(u_tint, "u_tint");
-    AP_UNIFORM(u_lit, "u_lit");
-    AP_UNIFORM(u_ambient, "u_ambient");
-    AP_UNIFORM(u_sun_direction, "u_sun_direction");
-    AP_UNIFORM(u_sun_color, "u_sun_color");
-    AP_UNIFORM(u_light_count, "u_light_count");
-    AP_UNIFORM(u_light_position, "u_light_position");
-    AP_UNIFORM(u_light_color, "u_light_color");
-    AP_UNIFORM(u_eye, "u_eye");
-    AP_UNIFORM(u_shininess, "u_shininess");
-    AP_UNIFORM(u_specular, "u_specular");
-    AP_UNIFORM(u_fog_color, "u_fog_color");
-    AP_UNIFORM(u_fog_range, "u_fog_range");
+    lookup_uniforms(&A.lit3);
+    lookup_uniforms(&A.depth3);
 
     A.batch = malloc(AP_BATCH_VERTICES * sizeof(Vertex2));
     A.batch3 = malloc(AP_BATCH_VERTICES * sizeof(Vertex3));
@@ -806,15 +1019,25 @@ void ap_open(const char *title, long width, long height, long flags) {
     glGenBuffers_(1, &A.vbo3);
     glBindBuffer_(GL_ARRAY_BUFFER, A.vbo3);
     glBufferData_(GL_ARRAY_BUFFER, AP_BATCH_VERTICES * sizeof(Vertex3), NULL, GL_STREAM_DRAW);
-    for (int i = 0; i < 4; i++)
-        glEnableVertexAttribArray_(i);
-    glVertexAttribPointer_(0, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex3), (void *)0);
-    glVertexAttribPointer_(1, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex3),
-                           (void *)offsetof(Vertex3, nx));
-    glVertexAttribPointer_(2, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex3),
-                           (void *)offsetof(Vertex3, u));
-    glVertexAttribPointer_(3, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(Vertex3),
-                           (void *)offsetof(Vertex3, r));
+    vertex3_layout();
+    /* One instance buffer shared by every mesh's vertex array; never empty, so plain draws can
+       read instance 0 from it harmlessly. */
+    A.instance_capacity = 256;
+    A.instance_data = malloc((size_t)A.instance_capacity * 20 * sizeof(float));
+    glGenBuffers_(1, &A.instance_vbo);
+    glBindBuffer_(GL_ARRAY_BUFFER, A.instance_vbo);
+    glBufferData_(GL_ARRAY_BUFFER, (ptrdiff_t)A.instance_capacity * 20 * sizeof(float), NULL,
+                  GL_STREAM_DRAW);
+    glBindVertexArray_(A.vao3);
+    instance_layout();
+    glBindVertexArray_(0);
+    glGenTextures_(1, &A.joint_texture);
+    glBindTexture_(GL_TEXTURE_2D, A.joint_texture);
+    glTexImage2D_(GL_TEXTURE_2D, 0, 0x8814 /* GL_RGBA32F */, AP_MAX_JOINTS * 4, 1, 0, GL_RGBA,
+                  GL_FLOAT, NULL);
+    glTexParameteri_(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri_(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    A.shadow_strength = 0.75f;
 
     static const unsigned char white_pixel[4] = {255, 255, 255, 255};
     A.white = texture_create(white_pixel, 1, 1, false);
@@ -870,6 +1093,16 @@ void ap_close(void) {
     for (int i = 1; i < AP_MAX_SOUNDS; i++)
         if (A.sounds[i].used)
             SDL_free(A.sounds[i].data);
+    for (int i = 1; i < AP_MAX_MODELS; i++)
+        if (A.models[i])
+            model_release(A.models[i]);
+    if (A.shadow_fbo) {
+        glDeleteFramebuffers_(1, &A.shadow_fbo);
+        glDeleteTextures_(1, &A.shadow_depth);
+    }
+    glDeleteTextures_(1, &A.joint_texture);
+    glDeleteBuffers_(1, &A.instance_vbo);
+    free(A.instance_data);
     free(A.batch);
     free(A.batch3);
     free(A.build_vertices);
@@ -1023,6 +1256,7 @@ bool ap_frame(void) {
     A.transform_depth = 0;
     A.model_depth = 0;
     m4_identity(A.model[0]);
+    A.shadow_ready = false; /* each frame draws its own shadows */
     set_target();
     return !A.closing;
 }
@@ -1309,7 +1543,7 @@ void ap_untransform(double x, double y) {
     A.result[1] = (-t[1] * px + t[0] * py) / determinant;
 }
 double ap_result(long index) {
-    return index >= 0 && index < 8 ? A.result[index] : 0;
+    return index >= 0 && index < 16 ? A.result[index] : 0;
 }
 #define AP_COLOR(name) unsigned char name[4] = {channel(r), channel(g), channel(b), channel(a)}
 void ap_rect(double x, double y, double w, double h, long r, long g, long b, long a) {
@@ -1493,9 +1727,20 @@ static SDL_Surface *load_surface(const char *path) {
     return surface;
 }
 /* Loads a PNG or BMP image. `smooth` filters it when scaled; pixel art wants false. */
+/* Loads a PNG, JPEG, BMP, or TGA image. */
 long ap_texture_load(const char *path, bool smooth) {
     if (!ready())
         return 0;
+    int width, height, channels;
+    unsigned char *pixels = stbi_load(path, &width, &height, &channels, 4);
+    if (pixels) {
+        int id = width <= 16384 && height <= 16384 ? texture_create(pixels, width, height, smooth)
+                                                   : 0;
+        stbi_image_free(pixels);
+        if (!id)
+            fail("image '%s' is larger than 16384 pixels", path);
+        return id;
+    }
     SDL_Surface *surface = load_surface(path);
     return surface ? texture_from_surface(surface, smooth) : 0;
 }
@@ -1971,26 +2216,103 @@ double ap_text_height(long id, const char *text, double size) {
 }
 
 /* --- 3D ------------------------------------------------------------------------------------ */
-static void upload3(const float *model, GLuint texture, const unsigned char *tint, bool lit) {
-    glUseProgram_(A.program3);
-    glUniformMatrix4fv_(A.u_model, 1, GL_FALSE, model);
-    glUniformMatrix4fv_(A.u_viewproj, 1, GL_FALSE, A.viewproj);
+/* What one 3D draw call needs besides its vertices. */
+typedef struct {
+    const float *model; /* the model matrix; for instanced draws, what applies before each
+                           instance's own matrix (the current 3D transform goes after it) */
+    GLuint texture;     /* the texture of a draw without a material */
+    const unsigned char *tint;
+    bool lit, instanced, skinned;
+    const Material *material; /* or NULL */
+} Draw3;
+static float to_srgb(float c) {
+    return powf(c > 0 ? c : 0, 1 / 2.2f);
+}
+static GLuint map_texture(const Material *m, int map) {
+    Texture *t = m && m->maps[map] > 0 && m->maps[map] < AP_MAX_TEXTURES &&
+                         A.textures[m->maps[map]].used
+                     ? &A.textures[m->maps[map]]
+                     : NULL;
+    return t ? t->id : 0;
+}
+static void upload3(const Draw3 *d) {
+    Program3 *p = A.shadow_pass ? &A.depth3 : &A.lit3;
+    const GLint *u = p->u;
+    const Material *m = d->material;
+    glUseProgram_(p->id);
+    glUniformMatrix4fv_(u[U_model], 1, GL_FALSE, d->model);
+    glUniformMatrix4fv_(u[U_stack], 1, GL_FALSE, A.model[A.model_depth]);
+    glUniformMatrix4fv_(u[U_viewproj], 1, GL_FALSE, A.viewproj);
     /* Normals use the inverse transpose of the model's upper 3x3, so scaling keeps them right. */
     float inverse[16], normal[9];
-    if (!m4_invert(inverse, model))
+    if (!m4_invert(inverse, d->model))
         m4_identity(inverse);
     for (int c = 0; c < 3; c++)
         for (int r = 0; r < 3; r++)
             normal[c * 3 + r] = inverse[r * 4 + c];
-    glUniformMatrix3fv_(A.u_normal, 1, GL_FALSE, normal);
-    glUniform1i_(A.u_texture3, 0);
-    glUniform4f_(A.u_tint, tint[0] / 255.0f, tint[1] / 255.0f, tint[2] / 255.0f, tint[3] / 255.0f);
-    glUniform1i_(A.u_lit, lit && A.lighting);
-    glUniform3fv_(A.u_ambient, 1, A.ambient);
+    glUniformMatrix3fv_(u[U_normal], 1, GL_FALSE, normal);
+    glUniform1i_(u[U_instanced], d->instanced);
+    glUniform1i_(u[U_skinned], d->skinned);
+    float tint[4] = {d->tint[0] / 255.0f, d->tint[1] / 255.0f, d->tint[2] / 255.0f,
+                     d->tint[3] / 255.0f};
+    if (m) /* the material's linear color, back in the sRGB of the texture and the tint */
+        for (int i = 0; i < 4; i++)
+            tint[i] *= i < 3 ? to_srgb(m->color[i]) : m->color[3];
+    glUniform4fv_(u[U_tint], 1, tint);
+    glUniform1f_(u[U_alpha_cutoff], m ? m->alpha_cutoff : 0);
+    glUniform1i_(u[U_texture], 0);
+    glUniform1i_(u[U_normal_map], 1);
+    glUniform1i_(u[U_metal_rough], 2);
+    glUniform1i_(u[U_emissive_map], 3);
+    glUniform1i_(u[U_occlusion_map], 4);
+    glUniform1i_(u[U_shadow_map], 5);
+    glUniform1i_(u[U_joints], 6);
+    GLuint base = m ? map_texture(m, MAP_BASE) : d->texture;
+    GLuint maps[5] = {base ? base : white(), map_texture(m, MAP_NORMAL),
+                      map_texture(m, MAP_METAL_ROUGH), map_texture(m, MAP_EMISSIVE),
+                      map_texture(m, MAP_OCCLUSION)};
+    for (int i = 0; i < 5; i++) {
+        glActiveTexture_(GL_TEXTURE0 + i);
+        glBindTexture_(GL_TEXTURE_2D, maps[i] ? maps[i] : white());
+    }
+    glActiveTexture_(GL_TEXTURE6);
+    glBindTexture_(GL_TEXTURE_2D, A.joint_texture);
+    if (A.shadow_pass) {
+        glActiveTexture_(GL_TEXTURE0);
+        return;
+    }
+    bool shadowed = A.shadows && A.shadow_ready;
+    glActiveTexture_(GL_TEXTURE5);
+    glBindTexture_(GL_TEXTURE_2D, shadowed ? A.shadow_depth : 0);
+    glActiveTexture_(GL_TEXTURE0);
+    glUniform1i_(u[U_shadows], shadowed);
+    if (shadowed) {
+        glUniformMatrix4fv_(u[U_light_viewproj], 1, GL_FALSE, A.shadow_viewproj);
+        glUniform1f_(u[U_shadow_offset], A.shadow_offset);
+        glUniform1f_(u[U_shadow_strength], A.shadow_strength);
+        glUniform2f_(u[U_shadow_texel], 1.0f / A.shadow_size, 1.0f / A.shadow_size);
+    } else {
+        float identity[16];
+        m4_identity(identity);
+        glUniformMatrix4fv_(u[U_light_viewproj], 1, GL_FALSE, identity);
+        glUniform1f_(u[U_shadow_offset], 0);
+    }
+    glUniform1i_(u[U_lit], d->lit && A.lighting && !(m && m->unlit));
+    glUniform1i_(u[U_pbr], m != NULL);
+    if (m) {
+        glUniform1f_(u[U_metallic], m->metallic);
+        glUniform1f_(u[U_roughness], m->roughness);
+        glUniform3fv_(u[U_emissive], 1, m->emissive);
+        glUniform1f_(u[U_normal_scale], m->normal_scale);
+        glUniform1i_(u[U_has_normal_map], maps[1] != 0);
+        glUniform1f_(u[U_occlusion_strength], maps[4] ? m->occlusion_strength : 0);
+    } else
+        glUniform1i_(u[U_has_normal_map], 0);
+    glUniform3fv_(u[U_ambient], 1, A.ambient);
     float direction[3] = {A.sun_direction[0], A.sun_direction[1], A.sun_direction[2]};
     v3_normalize(direction);
-    glUniform3fv_(A.u_sun_direction, 1, direction);
-    glUniform3fv_(A.u_sun_color, 1, A.sun_color);
+    glUniform3fv_(u[U_sun_direction], 1, direction);
+    glUniform3fv_(u[U_sun_color], 1, A.sun_color);
     float positions[AP_MAX_LIGHTS * 4], colors[AP_MAX_LIGHTS * 3];
     int count = 0;
     for (int i = 0; i < AP_MAX_LIGHTS; i++)
@@ -1999,18 +2321,16 @@ static void upload3(const float *model, GLuint texture, const unsigned char *tin
             memcpy(colors + count * 3, A.light_color[i], 3 * sizeof(float));
             count++;
         }
-    glUniform1i_(A.u_light_count, count);
+    glUniform1i_(u[U_light_count], count);
     if (count) {
-        glUniform4fv_(A.u_light_position, count, positions);
-        glUniform3fv_(A.u_light_color, count, colors);
+        glUniform4fv_(u[U_light_position], count, positions);
+        glUniform3fv_(u[U_light_color], count, colors);
     }
-    glUniform3fv_(A.u_eye, 1, A.eye);
-    glUniform1f_(A.u_shininess, A.shininess);
-    glUniform1f_(A.u_specular, A.specular);
-    glUniform3fv_(A.u_fog_color, 1, A.fog_color);
-    glUniform2f_(A.u_fog_range, A.fog_start, A.fog_end);
-    glActiveTexture_(GL_TEXTURE0);
-    glBindTexture_(GL_TEXTURE_2D, texture);
+    glUniform3fv_(u[U_eye], 1, A.eye);
+    glUniform1f_(u[U_shininess], A.shininess);
+    glUniform1f_(u[U_specular], A.specular);
+    glUniform3fv_(u[U_fog_color], 1, A.fog_color);
+    glUniform2f_(u[U_fog_range], A.fog_start, A.fog_end);
 }
 /* Draws the lines and billboards collected since the last flush. */
 static void flush3(void) {
@@ -2019,7 +2339,9 @@ static void flush3(void) {
     static const unsigned char no_tint[4] = {255, 255, 255, 255};
     float identity[16];
     m4_identity(identity);
-    upload3(identity, A.batch3_texture ? A.batch3_texture : white(), no_tint, false);
+    Draw3 draw = {identity, A.batch3_texture ? A.batch3_texture : white(), no_tint, false, false,
+                  false, NULL};
+    upload3(&draw); /* batched vertices are already in world space */
     glBindVertexArray_(A.vao3);
     glBindBuffer_(GL_ARRAY_BUFFER, A.vbo3);
     glBufferData_(GL_ARRAY_BUFFER, AP_BATCH_VERTICES * sizeof(Vertex3), NULL, GL_STREAM_DRAW);
@@ -2045,6 +2367,10 @@ void ap_begin3d(double eye_x, double eye_y, double eye_z, double target_x, doubl
                 double far) {
     if (!ready())
         return;
+    if (A.shadow_pass) {
+        fail("begin_3d inside begin_shadows; call end_shadows first");
+        return;
+    }
     flush();
     float eye[3] = {(float)eye_x, (float)eye_y, (float)eye_z};
     float target[3] = {(float)target_x, (float)target_y, (float)target_z};
@@ -2071,10 +2397,11 @@ void ap_begin3d(double eye_x, double eye_y, double eye_z, double target_x, doubl
     glDepthMask_(GL_TRUE);
     glEnable_(GL_CULL_FACE);
     glCullFace_(GL_BACK);
+    A.culling = A.depth_writing = true;
     glPolygonMode_(GL_FRONT_AND_BACK, A.wireframe ? GL_LINE : GL_FILL);
 }
 void ap_end3d(void) {
-    if (!A.open || !A.in3d)
+    if (!A.open || !A.in3d || A.shadow_pass)
         return;
     flush3();
     A.in3d = false;
@@ -2148,7 +2475,7 @@ void ap_fog(long r, long g, long b, double start, double end) {
 }
 void ap_wireframe(bool on) {
     A.wireframe = on;
-    if (A.open && A.in3d) {
+    if (A.open && A.in3d && !A.shadow_pass) {
         flush3();
         glPolygonMode_(GL_FRONT_AND_BACK, on ? GL_LINE : GL_FILL);
     }
@@ -2158,6 +2485,7 @@ void ap_cull(bool on) {
     if (!A.open || !A.in3d)
         return;
     flush3();
+    A.culling = on;
     if (on)
         glEnable_(GL_CULL_FACE);
     else
@@ -2168,11 +2496,12 @@ void ap_depth_write(bool on) {
     if (!A.open)
         return;
     flush3();
+    A.depth_writing = on;
     glDepthMask_(on ? GL_TRUE : GL_FALSE);
 }
 void ap_line3d(double x1, double y1, double z1, double x2, double y2, double z2, long r, long g,
                long b, long a) {
-    if (!in3d())
+    if (!in3d() || A.shadow_pass)
         return;
     AP_COLOR(color);
     Vertex3 *v = reserve3(GL_LINES, 0, 2);
@@ -2199,7 +2528,7 @@ void ap_grid(long cells, double spacing, long r, long g, long b, long a) {
 /* A texture region facing the camera at a point in space, `width` by `height` units. */
 void ap_billboard(long id, double sx, double sy, double sw, double sh, double x, double y,
                   double z, double width, double height, long r, long g, long b, long a) {
-    if (!in3d())
+    if (!in3d() || A.shadow_pass)
         return;
     Texture *t = texture_of(id);
     if (!t) {
@@ -2271,6 +2600,7 @@ void ap_screen_ray(double x, double y) {
 /* --- Meshes -------------------------------------------------------------------------------- */
 void ap_mesh_begin(void) {
     A.build_vertex_count = A.build_index_count = 0;
+    A.build_tangents = false;
     A.build_color[0] = A.build_color[1] = A.build_color[2] = A.build_color[3] = 255;
 }
 void ap_mesh_color(long r, long g, long b, long a) {
@@ -2289,6 +2619,9 @@ long ap_mesh_vertex(double x, double y, double z, double nx, double ny, double n
     out->nx = (float)nx, out->ny = (float)ny, out->nz = (float)nz;
     out->u = (float)u, out->v = (float)v;
     memcpy(&out->r, A.build_color, 4);
+    out->tx = 1, out->ty = out->tz = 0, out->tw = 1;
+    memset(out->joints, 0, sizeof out->joints);
+    memset(out->weights, 0, sizeof out->weights);
     return A.build_vertex_count++;
 }
 /* Adds a triangle of three vertex indices, counterclockwise seen from its front. */
@@ -2327,6 +2660,50 @@ void ap_mesh_smooth(void) {
     for (int i = 0; i < A.build_vertex_count; i++)
         v3_normalize(&A.build_vertices[i].nx);
 }
+/* Tangents along the texture's u direction, for normal maps (per vertex, from the triangles
+   around it; w says whether the v direction is mirrored). */
+static void compute_tangents(void) {
+    int n = A.build_vertex_count;
+    float *sum = calloc((size_t)n * 6, sizeof(float)); /* tangent then bitangent */
+    for (int i = 0; i + 2 < A.build_index_count; i += 3) {
+        unsigned k[3] = {A.build_indices[i], A.build_indices[i + 1], A.build_indices[i + 2]};
+        Vertex3 *p = &A.build_vertices[k[0]], *q = &A.build_vertices[k[1]],
+                *r = &A.build_vertices[k[2]];
+        float e1[3] = {q->x - p->x, q->y - p->y, q->z - p->z};
+        float e2[3] = {r->x - p->x, r->y - p->y, r->z - p->z};
+        float du1 = q->u - p->u, dv1 = q->v - p->v, du2 = r->u - p->u, dv2 = r->v - p->v;
+        float det = du1 * dv2 - du2 * dv1;
+        if (fabsf(det) < 1e-12f)
+            continue;
+        float f = 1 / det;
+        for (int c = 0; c < 3; c++) {
+            float t = (e1[c] * dv2 - e2[c] * dv1) * f, b = (e2[c] * du1 - e1[c] * du2) * f;
+            for (int j = 0; j < 3; j++) {
+                sum[k[j] * 6 + c] += t;
+                sum[k[j] * 6 + 3 + c] += b;
+            }
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        Vertex3 *v = &A.build_vertices[i];
+        float *t = sum + i * 6, *b = t + 3, nn[3] = {v->nx, v->ny, v->nz};
+        float d = nn[0] * t[0] + nn[1] * t[1] + nn[2] * t[2];
+        float o[3] = {t[0] - nn[0] * d, t[1] - nn[1] * d, t[2] - nn[2] * d};
+        if (o[0] * o[0] + o[1] * o[1] + o[2] * o[2] < 1e-20f) {
+            /* no usable texture direction: any direction across the normal */
+            float axis[3] = {fabsf(nn[0]) < 0.9f ? 1.0f : 0.0f, fabsf(nn[0]) < 0.9f ? 0.0f : 1.0f, 0};
+            float c[3];
+            v3_cross(c, axis, nn);
+            v3_cross(o, nn, c);
+        }
+        v3_normalize(o);
+        float c[3];
+        v3_cross(c, nn, o);
+        v->tx = o[0], v->ty = o[1], v->tz = o[2];
+        v->tw = c[0] * b[0] + c[1] * b[1] + c[2] * b[2] < 0 ? -1.0f : 1.0f;
+    }
+    free(sum);
+}
 /* Finishes the mesh being built and returns its handle. */
 long ap_mesh_end(void) {
     if (!ready())
@@ -2343,6 +2720,9 @@ long ap_mesh_end(void) {
         fail("too many meshes (%d)", AP_MAX_MESHES - 1);
         return 0;
     }
+    if (!A.build_tangents)
+        compute_tangents();
+    flush3();
     Mesh *mesh = &A.meshes[slot];
     glGenVertexArrays_(1, &mesh->vao);
     glBindVertexArray_(mesh->vao);
@@ -2354,24 +2734,28 @@ long ap_mesh_end(void) {
     glBindBuffer_(GL_ELEMENT_ARRAY_BUFFER, mesh->ebo);
     glBufferData_(GL_ELEMENT_ARRAY_BUFFER, A.build_index_count * sizeof(unsigned), A.build_indices,
                   GL_STATIC_DRAW);
-    for (int i = 0; i < 4; i++)
-        glEnableVertexAttribArray_(i);
-    glVertexAttribPointer_(0, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex3), (void *)0);
-    glVertexAttribPointer_(1, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex3),
-                           (void *)offsetof(Vertex3, nx));
-    glVertexAttribPointer_(2, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex3),
-                           (void *)offsetof(Vertex3, u));
-    glVertexAttribPointer_(3, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(Vertex3),
-                           (void *)offsetof(Vertex3, r));
+    vertex3_layout();
+    instance_layout();
     glBindVertexArray_(0);
     mesh->index_count = A.build_index_count;
     mesh->vertex_count = A.build_vertex_count;
     mesh->radius = 0;
+    mesh->skinned = false;
+    for (int c = 0; c < 3; c++) {
+        mesh->low[c] = INFINITY;
+        mesh->high[c] = -INFINITY;
+    }
     for (int i = 0; i < A.build_vertex_count; i++) {
         Vertex3 *v = &A.build_vertices[i];
         float d = sqrtf(v->x * v->x + v->y * v->y + v->z * v->z);
         if (d > mesh->radius)
             mesh->radius = d;
+        for (int c = 0; c < 3; c++) {
+            mesh->low[c] = fminf(mesh->low[c], (&v->x)[c]);
+            mesh->high[c] = fmaxf(mesh->high[c], (&v->x)[c]);
+        }
+        if (v->weights[0] + v->weights[1] + v->weights[2] + v->weights[3] > 0)
+            mesh->skinned = true;
     }
     mesh->used = true;
     return slot;
@@ -2396,10 +2780,49 @@ void ap_mesh_free(long id) {
     glDeleteBuffers_(1, &mesh->ebo);
     memset(mesh, 0, sizeof *mesh);
 }
+/* A placement: translated, rotated by x, y, then z degrees, and scaled. */
+static void placement(float *m, double x, double y, double z, double rx, double ry, double rz,
+                      double sx, double sy, double sz) {
+    m4_translate(m, (float)x, (float)y, (float)z);
+    if (rz != 0)
+        m4_rotate(m, (float)rz, 0, 0, 1);
+    if (ry != 0)
+        m4_rotate(m, (float)ry, 0, 1, 0);
+    if (rx != 0)
+        m4_rotate(m, (float)rx, 1, 0, 0);
+    m4_scale(m, (float)sx, (float)sy, (float)sz);
+}
+static Material *material_of(long id) {
+    return id > 0 && id < AP_MAX_MATERIALS && A.materials[id].used ? &A.materials[id] : NULL;
+}
+/* Draws `mesh` (`instances` times from the instance buffer when above 0), honoring the
+   material's two-sidedness and transparency. */
+static void draw_mesh(const Mesh *mesh, const Draw3 *d, int instances) {
+    upload3(d);
+    const Material *m = d->material;
+    bool two_sided = m && m->double_sided && A.culling;
+    bool see_through = m && m->blend && A.depth_writing && !A.shadow_pass;
+    if (two_sided)
+        glDisable_(GL_CULL_FACE);
+    if (see_through)
+        glDepthMask_(GL_FALSE);
+    glBindVertexArray_(mesh->vao);
+    if (instances > 0)
+        glDrawElementsInstanced_(GL_TRIANGLES, mesh->index_count, GL_UNSIGNED_INT, (void *)0,
+                                 instances);
+    else
+        glDrawElements_(GL_TRIANGLES, mesh->index_count, GL_UNSIGNED_INT, (void *)0);
+    if (two_sided)
+        glEnable_(GL_CULL_FACE);
+    if (see_through)
+        glDepthMask_(GL_TRUE);
+}
 /* Draws a mesh at a position, rotated by x, y, then z degrees, scaled, and tinted. Texture 0
-   leaves it untextured. The current 3D transform applies first. */
-void ap_mesh_draw(long id, long texture, double x, double y, double z, double rx, double ry,
-                  double rz, double sx, double sy, double sz, long r, long g, long b, long a) {
+   leaves it untextured; a material replaces the texture and lights it physically. The current
+   3D transform applies first. */
+void ap_mesh_draw(long id, long texture, long material, double x, double y, double z, double rx,
+                  double ry, double rz, double sx, double sy, double sz, long r, long g, long b,
+                  long a) {
     if (!in3d())
         return;
     Mesh *mesh = mesh_of(id);
@@ -2411,19 +2834,284 @@ void ap_mesh_draw(long id, long texture, double x, double y, double z, double rx
     AP_COLOR(color);
     float model[16];
     memcpy(model, A.model[A.model_depth], sizeof model);
-    m4_translate(model, (float)x, (float)y, (float)z);
-    if (rz != 0)
-        m4_rotate(model, (float)rz, 0, 0, 1);
-    if (ry != 0)
-        m4_rotate(model, (float)ry, 0, 1, 0);
-    if (rx != 0)
-        m4_rotate(model, (float)rx, 1, 0, 0);
-    m4_scale(model, (float)sx, (float)sy, (float)sz);
+    placement(model, x, y, z, rx, ry, rz, sx, sy, sz);
     Texture *t = texture_of(texture);
-    upload3(model, t ? t->id : white(), color, true);
-    glBindVertexArray_(mesh->vao);
-    glDrawElements_(GL_TRIANGLES, mesh->index_count, GL_UNSIGNED_INT, (void *)0);
+    Draw3 d = {model, t ? t->id : white(), color, true, false, false, material_of(material)};
+    draw_mesh(mesh, &d, 0);
 }
+/* Fills the instance buffer from `count` column-major matrices of 16 doubles and, when
+   `color_count` is `count`, colors of four 64-bit integers each (else every instance is white). */
+static bool fill_instances(const double *matrices, long count, const long long *colors,
+                           long color_count) {
+    if (count <= 0)
+        return false;
+    if (count > 1000000) {
+        fail("too many instances in one draw (%ld; at most 1000000)", count);
+        return false;
+    }
+    if (count > A.instance_capacity) {
+        while (A.instance_capacity < count)
+            A.instance_capacity *= 2;
+        A.instance_data =
+            realloc(A.instance_data, (size_t)A.instance_capacity * 20 * sizeof(float));
+        glBindBuffer_(GL_ARRAY_BUFFER, A.instance_vbo);
+        glBufferData_(GL_ARRAY_BUFFER, (ptrdiff_t)A.instance_capacity * 20 * sizeof(float), NULL,
+                      GL_STREAM_DRAW);
+    }
+    for (long i = 0; i < count; i++) {
+        float *out = A.instance_data + i * 20;
+        for (int k = 0; k < 16; k++)
+            out[k] = (float)matrices[i * 16 + k];
+        for (int k = 0; k < 4; k++)
+            out[16 + k] = colors && color_count == count ? channel((long)colors[i * 4 + k]) / 255.0f
+                                                         : 1.0f;
+    }
+    glBindBuffer_(GL_ARRAY_BUFFER, A.instance_vbo);
+    glBufferData_(GL_ARRAY_BUFFER, (ptrdiff_t)A.instance_capacity * 20 * sizeof(float), NULL,
+                  GL_STREAM_DRAW);
+    glBufferSubData_(GL_ARRAY_BUFFER, 0, (ptrdiff_t)count * 20 * sizeof(float), A.instance_data);
+    return true;
+}
+/* Draws a mesh once per matrix in one call: `matrices` holds `count` Mat4 values, `colors`
+   `color_count` Color values (tinting each instance when there is one per matrix). */
+void ap_mesh_draw_many(long id, long texture, long material, const void *matrices, long count,
+                       const void *colors, long color_count, long r, long g, long b, long a) {
+    if (!in3d())
+        return;
+    Mesh *mesh = mesh_of(id);
+    if (!mesh) {
+        fail("drawing a mesh that does not exist (or was freed)");
+        return;
+    }
+    flush3();
+    if (!matrices || !fill_instances((const double *)matrices, count, (const long long *)colors,
+                                     color_count))
+        return;
+    AP_COLOR(color);
+    float identity[16];
+    m4_identity(identity);
+    Texture *t = texture_of(texture);
+    Draw3 d = {identity, t ? t->id : white(), color, true, true, false, material_of(material)};
+    draw_mesh(mesh, &d, (int)count);
+}
+
+/* --- Materials ----------------------------------------------------------------------------- */
+static float to_linear(float c) {
+    return powf(c > 0 ? c : 0, 2.2f);
+}
+static int material_create(void) {
+    int slot = 0;
+    for (int i = 1; i < AP_MAX_MATERIALS && !slot; i++)
+        if (!A.materials[i].used)
+            slot = i;
+    if (!slot) {
+        fail("too many materials (%d)", AP_MAX_MATERIALS - 1);
+        return 0;
+    }
+    Material *m = &A.materials[slot];
+    memset(m, 0, sizeof *m);
+    m->used = true;
+    m->color[0] = m->color[1] = m->color[2] = m->color[3] = 1;
+    m->metallic = 0;
+    m->roughness = 0.5f;
+    m->normal_scale = 1;
+    m->occlusion_strength = 1;
+    return slot;
+}
+/* A material: white, not metallic, half rough, with no textures. */
+long ap_material_create(void) {
+    return ready() ? material_create() : 0;
+}
+/* The base color (sRGB, 0 to 255 like every other color). */
+void ap_material_color(long id, long r, long g, long b, long a) {
+    Material *m = material_of(id);
+    if (!m)
+        return;
+    m->color[0] = to_linear(channel(r) / 255.0f), m->color[1] = to_linear(channel(g) / 255.0f);
+    m->color[2] = to_linear(channel(b) / 255.0f), m->color[3] = channel(a) / 255.0f;
+}
+/* How metallic (0 to 1) and how rough (0 polished to 1 matte) the surface is. */
+void ap_material_surface(long id, double metallic, double roughness) {
+    Material *m = material_of(id);
+    if (!m)
+        return;
+    m->metallic = (float)fmin(fmax(metallic, 0), 1);
+    m->roughness = (float)fmin(fmax(roughness, 0), 1);
+}
+/* Light the surface gives off by itself, `strength` times a color. */
+void ap_material_emissive(long id, long r, long g, long b, double strength) {
+    Material *m = material_of(id);
+    if (!m)
+        return;
+    m->emissive[0] = to_linear(channel(r) / 255.0f) * (float)strength;
+    m->emissive[1] = to_linear(channel(g) / 255.0f) * (float)strength;
+    m->emissive[2] = to_linear(channel(b) / 255.0f) * (float)strength;
+}
+/* Texture `map`: 0 the base color, 1 the normal map, 2 metallic (blue) and roughness (green),
+   3 emission, 4 ambient occlusion (red). Texture 0 removes it. */
+void ap_material_map(long id, long map, long texture) {
+    Material *m = material_of(id);
+    if (!m || map < 0 || map >= MAP_COUNT)
+        return;
+    if (m->owned[map] && m->maps[map] != texture)
+        ap_texture_free(m->maps[map]);
+    m->maps[map] = texture_of(texture) ? (int)texture : 0;
+    m->owned[map] = false;
+}
+/* How strongly the normal map bends the surface (1 as painted). */
+void ap_material_normal_scale(long id, double scale) {
+    Material *m = material_of(id);
+    if (m)
+        m->normal_scale = (float)scale;
+}
+/* Pixels less opaque than `cutoff` are not drawn (0 keeps them): leaves, fences, hair. */
+void ap_material_cutoff(long id, double cutoff) {
+    Material *m = material_of(id);
+    if (m)
+        m->alpha_cutoff = (float)fmin(fmax(cutoff, 0), 1);
+}
+/* Options: 1 two-sided, 2 transparent (blended, without hiding what is behind it), 4 unlit. */
+void ap_material_options(long id, long options) {
+    Material *m = material_of(id);
+    if (!m)
+        return;
+    m->double_sided = options & 1;
+    m->blend = options & 2;
+    m->unlit = options & 4;
+}
+void ap_material_free(long id) {
+    Material *m = material_of(id);
+    if (!m)
+        return;
+    for (int i = 0; i < MAP_COUNT; i++)
+        if (m->owned[i])
+            ap_texture_free(m->maps[i]);
+    memset(m, 0, sizeof *m);
+}
+
+/* --- Shadows ------------------------------------------------------------------------------- */
+/* Shadows of the sun, through a `size` pixel square shadow map; `strength` 0 to 1 is how dark
+   they are. */
+void ap_shadows(bool on, long size, double strength) {
+    if (!ready())
+        return;
+    if (A.shadow_pass) {
+        fail("changing shadows inside begin_shadows");
+        return;
+    }
+    A.shadow_strength = (float)fmin(fmax(strength, 0), 1);
+    if (size < 64)
+        size = 64;
+    if (size > 8192)
+        size = 8192;
+    if (A.shadow_fbo && (!on || A.shadow_size != size)) {
+        glDeleteFramebuffers_(1, &A.shadow_fbo);
+        glDeleteTextures_(1, &A.shadow_depth);
+        A.shadow_fbo = A.shadow_depth = 0;
+    }
+    A.shadows = on;
+    A.shadow_ready = false;
+    if (!on || A.shadow_fbo)
+        return;
+    flush();
+    A.shadow_size = (int)size;
+    glGenTextures_(1, &A.shadow_depth);
+    glBindTexture_(GL_TEXTURE_2D, A.shadow_depth);
+    glTexImage2D_(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT24, (int)size, (int)size, 0,
+                  GL_DEPTH_COMPONENT, GL_FLOAT, NULL);
+    glTexParameteri_(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri_(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri_(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, 0x812D /* GL_CLAMP_TO_BORDER */);
+    glTexParameteri_(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, 0x812D);
+    static const float border[4] = {1, 1, 1, 1};
+    glTexParameterfv_(GL_TEXTURE_2D, 0x1004 /* GL_TEXTURE_BORDER_COLOR */, border);
+    glTexParameteri_(GL_TEXTURE_2D, 0x884C /* GL_TEXTURE_COMPARE_MODE */,
+                     0x884E /* GL_COMPARE_REF_TO_TEXTURE */);
+    glTexParameteri_(GL_TEXTURE_2D, 0x884D /* GL_TEXTURE_COMPARE_FUNC */, GL_LEQUAL);
+    glGenFramebuffers_(1, &A.shadow_fbo);
+    glBindFramebuffer_(GL_FRAMEBUFFER, A.shadow_fbo);
+    glFramebufferTexture2D_(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, A.shadow_depth, 0);
+    glDrawBuffer_(GL_NONE);
+    glReadBuffer_(GL_NONE);
+    bool complete = glCheckFramebufferStatus_(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+    set_target();
+    if (!complete) {
+        fail("the graphics driver rejected a %ldx%ld shadow map", size, size);
+        ap_shadows(false, size, strength);
+    }
+}
+/* Starts drawing the things that cast shadows, as seen from the sun, over a sphere around a
+   point (everything outside it casts and receives no shadow). Ends with ap_shadow_end; 3D
+   drawing afterwards in this frame is shadowed. */
+void ap_shadow_begin(double x, double y, double z, double radius) {
+    if (!ready())
+        return;
+    if (A.in3d) {
+        fail(A.shadow_pass ? "begin_shadows twice; call end_shadows first"
+                           : "begin_shadows inside begin_3d; call end_3d first");
+        return;
+    }
+    if (!A.shadows || !A.shadow_fbo) {
+        fail("shadows are off; call shadows(true) first");
+        return;
+    }
+    flush();
+    float r = (float)(radius > 0.01 ? radius : 0.01);
+    float direction[3] = {A.sun_direction[0], A.sun_direction[1], A.sun_direction[2]};
+    v3_normalize(direction);
+    float center[3] = {(float)x, (float)y, (float)z};
+    float eye[3] = {center[0] - direction[0] * r * 2, center[1] - direction[1] * r * 2,
+                    center[2] - direction[2] * r * 2};
+    float up[3] = {0, 1, 0};
+    if (fabsf(direction[1]) > 0.99f)
+        up[1] = 0, up[2] = 1;
+    float view[16], projection[16];
+    m4_look_at(view, eye, center, up);
+    m4_ortho(projection, -r, r, -r, r, 0, r * 4);
+    m4_multiply(A.shadow_viewproj, projection, view);
+    /* Snap to whole shadow texels so the edges of shadows do not shimmer as the area moves. */
+    float origin[4] = {0, 0, 0, 1}, clip[4];
+    m4_transform(clip, A.shadow_viewproj, origin);
+    float half = A.shadow_size / 2.0f;
+    projection[12] += (roundf(clip[0] * half) - clip[0] * half) / half;
+    projection[13] += (roundf(clip[1] * half) - clip[1] * half) / half;
+    m4_multiply(A.shadow_viewproj, projection, view);
+    memcpy(A.viewproj, A.shadow_viewproj, sizeof A.viewproj);
+    memcpy(A.eye, eye, sizeof eye);
+    A.shadow_offset = 2 * r / A.shadow_size * 1.5f;
+    glBindFramebuffer_(GL_FRAMEBUFFER, A.shadow_fbo);
+    glViewport_(0, 0, A.shadow_size, A.shadow_size);
+    glDepthMask_(GL_TRUE);
+    glClear_(GL_DEPTH_BUFFER_BIT);
+    glEnable_(GL_DEPTH_TEST);
+    glDepthFunc_(GL_LEQUAL);
+    glDisable_(GL_CULL_FACE); /* thin and open shapes cast shadows from both sides */
+    A.culling = false;
+    A.depth_writing = true;
+    glEnable_(0x8037 /* GL_POLYGON_OFFSET_FILL */);
+    glPolygonOffset_(1.5f, 3.0f);
+    glPolygonMode_(GL_FRONT_AND_BACK, GL_FILL);
+    A.in3d = A.shadow_pass = true;
+    A.model_depth = 0;
+    m4_identity(A.model[0]);
+}
+void ap_shadow_end(void) {
+    if (!A.open || !A.shadow_pass)
+        return;
+    A.in3d = A.shadow_pass = false;
+    A.shadow_ready = true;
+    glDisable_(0x8037);
+    glDisable_(GL_DEPTH_TEST);
+    set_target();
+}
+bool ap_shadows_on(void) {
+    return A.shadows;
+}
+/* Whether draws are going into the shadow map now (so a scene can skip what casts none). */
+bool ap_shadow_casting(void) {
+    return A.shadow_pass;
+}
+
 /* Built-in shapes, centered on the origin. */
 static void face(const float *origin, const float *across, const float *up, const float *normal,
                  float tiles_u, float tiles_v) {
@@ -2637,6 +3325,285 @@ long ap_mesh_load(const char *path) {
     if (!had_normals)
         ap_mesh_smooth();
     return ap_mesh_end();
+}
+
+/* --- Models -------------------------------------------------------------------------------- */
+#include "model.h"
+
+static Model *model_of(long id) {
+    return id > 0 && id < AP_MAX_MODELS ? A.models[id] : NULL;
+}
+static Model *model_or_fail(long id) {
+    Model *model = model_of(id);
+    if (!model)
+        fail("using a model that is not loaded (or was freed)");
+    return model;
+}
+/* Loads a glTF 2.0 model (.gltf or .glb) or an OBJ model with its MTL materials. */
+long ap_model_load(const char *path) {
+    if (!ready())
+        return 0;
+    int slot = 0;
+    for (int i = 1; i < AP_MAX_MODELS && !slot; i++)
+        if (!A.models[i])
+            slot = i;
+    if (!slot) {
+        fail("too many models (%d)", AP_MAX_MODELS - 1);
+        return 0;
+    }
+    size_t length = strlen(path);
+    bool obj = length > 4 && SDL_strcasecmp(path + length - 4, ".obj") == 0;
+    char error[512] = "";
+    Model *model = obj ? load_obj(path, error, sizeof error) : load_gltf(path, error, sizeof error);
+    if (!model) {
+        fail("%s", error);
+        return 0;
+    }
+    model_bounds(model);
+    A.models[slot] = model;
+    return slot;
+}
+void ap_model_free(long id) {
+    Model *model = model_of(id);
+    if (!model)
+        return;
+    if (A.in3d)
+        flush3();
+    model_destroy(model);
+    A.models[id] = NULL;
+}
+long ap_model_triangles(long id) {
+    Model *model = model_of(id);
+    long total = 0;
+    for (int i = 0; model && i < model->primitive_count; i++)
+        total += ap_mesh_triangles(model->primitives[i].mesh);
+    return total;
+}
+/* The box around the model as loaded: results 0 to 2 are its low corner, 3 to 5 its high. */
+void ap_model_bounds(long id) {
+    Model *model = model_or_fail(id);
+    if (!model)
+        return;
+    memcpy(A.result, model->low, 3 * sizeof(float));
+    memcpy(A.result + 3, model->high, 3 * sizeof(float));
+}
+long ap_model_material_count(long id) {
+    Model *model = model_of(id);
+    return model ? model->material_count : 0;
+}
+/* Material `index` of the model, to change its settings (it stays the model's). */
+long ap_model_material(long id, long index) {
+    Model *model = model_of(id);
+    return model && index >= 0 && index < model->material_count ? model->materials[index] : 0;
+}
+long ap_model_clip_count(long id) {
+    Model *model = model_of(id);
+    return model ? model->clip_count : 0;
+}
+const char *ap_model_clip_name(long id, long clip) {
+    Model *model = model_of(id);
+    return model && clip >= 0 && clip < model->clip_count ? model->clips[clip].name : "";
+}
+double ap_model_clip_length(long id, long clip) {
+    Model *model = model_of(id);
+    return model && clip >= 0 && clip < model->clip_count ? model->clips[clip].length : 0;
+}
+/* The clip with a name, or -1. */
+long ap_model_clip_find(long id, const char *name) {
+    Model *model = model_of(id);
+    for (int i = 0; model && i < model->clip_count; i++)
+        if (!strcmp(model->clips[i].name, name))
+            return i;
+    return -1;
+}
+long ap_model_node_count(long id) {
+    Model *model = model_of(id);
+    return model ? model->node_count : 0;
+}
+const char *ap_model_node_name(long id, long node) {
+    Model *model = model_of(id);
+    return model && node >= 0 && node < model->node_count ? model->nodes[node].name : "";
+}
+long ap_model_node_find(long id, const char *name) {
+    Model *model = model_of(id);
+    for (int i = 0; model && i < model->node_count; i++)
+        if (!strcmp(model->nodes[i].name, name))
+            return i;
+    return -1;
+}
+/* Back to the pose the model was loaded in. */
+void ap_model_reset(long id) {
+    Model *model = model_or_fail(id);
+    if (!model)
+        return;
+    for (int i = 0; i < model->node_count; i++) {
+        Node *n = &model->nodes[i];
+        memcpy(n->t, n->rest_t, sizeof n->t);
+        memcpy(n->r, n->rest_r, sizeof n->r);
+        memcpy(n->s, n->rest_s, sizeof n->s);
+    }
+    model->posed = false;
+}
+/* Poses the model as clip `clip` is at `time` seconds (wrapped around when `loop`), mixed into
+   the current pose by `weight` (1 replaces it; less blends toward it, for crossfades). Nodes the
+   clip does not move keep their pose. */
+void ap_model_animate(long id, long clip, double time, double weight, bool loop) {
+    Model *model = model_or_fail(id);
+    if (!model)
+        return;
+    if (clip < 0 || clip >= model->clip_count) {
+        fail("the model has no animation %ld (it has %d)", clip, model->clip_count);
+        return;
+    }
+    Clip *c = &model->clips[clip];
+    float t = (float)time;
+    if (loop && c->length > 0) {
+        t = fmodf(t, c->length);
+        if (t < 0)
+            t += c->length;
+    }
+    float w = (float)fmin(fmax(weight, 0), 1);
+    if (w <= 0)
+        return;
+    for (int i = 0; i < c->channel_count; i++) {
+        Channel *channel = &c->channels[i];
+        Node *n = &model->nodes[channel->node];
+        float value[4];
+        sample(channel, t, value);
+        float *target = channel->path == PATH_TRANSLATION ? n->t
+                        : channel->path == PATH_ROTATION  ? n->r
+                                                          : n->s;
+        int width = channel->path == PATH_ROTATION ? 4 : 3;
+        if (channel->path == PATH_ROTATION) {
+            float dot = 0;
+            for (int k = 0; k < 4; k++)
+                dot += target[k] * value[k];
+            if (dot < 0)
+                for (int k = 0; k < 4; k++)
+                    value[k] = -value[k];
+        }
+        for (int k = 0; k < width; k++)
+            target[k] += (value[k] - target[k]) * w;
+        if (channel->path == PATH_ROTATION)
+            quat_normalize(target);
+        n->has_matrix = false;
+    }
+    model->posed = false;
+}
+/* Sets a node's own translation, rotation (a quaternion), and scale, relative to its parent. */
+void ap_model_node_set(long id, long node, double tx, double ty, double tz, double qx, double qy,
+                       double qz, double qw, double sx, double sy, double sz) {
+    Model *model = model_or_fail(id);
+    if (!model)
+        return;
+    if (node < 0 || node >= model->node_count) {
+        fail("the model has no node %ld", node);
+        return;
+    }
+    Node *n = &model->nodes[node];
+    n->t[0] = (float)tx, n->t[1] = (float)ty, n->t[2] = (float)tz;
+    n->r[0] = (float)qx, n->r[1] = (float)qy, n->r[2] = (float)qz, n->r[3] = (float)qw;
+    quat_normalize(n->r);
+    n->s[0] = (float)sx, n->s[1] = (float)sy, n->s[2] = (float)sz;
+    n->has_matrix = false;
+    model->posed = false;
+}
+/* A node's own transform: results 0 to 2 translation, 3 to 6 rotation, 7 to 9 scale. */
+void ap_model_node_local(long id, long node) {
+    Model *model = model_or_fail(id);
+    if (!model || node < 0 || node >= model->node_count)
+        return;
+    Node *n = &model->nodes[node];
+    memcpy(A.result, n->t, 3 * sizeof(float));
+    memcpy(A.result + 3, n->r, 4 * sizeof(float));
+    memcpy(A.result + 7, n->s, 3 * sizeof(float));
+}
+/* A node's transform in the model's space, in the current pose: results 0 to 15, column-major. */
+void ap_model_node_world(long id, long node) {
+    Model *model = model_or_fail(id);
+    if (!model)
+        return;
+    if (node < 0 || node >= model->node_count) {
+        fail("the model has no node %ld", node);
+        return;
+    }
+    model_pose(model);
+    memcpy(A.result, model->nodes[node].world, 16 * sizeof(float));
+}
+/* Draws every primitive of the model: opaque ones first, then see-through ones. `base` is the
+   placement (for instanced draws, what each instance's matrix applies to). */
+static void draw_model(Model *model, const float *base, long material, const unsigned char *tint,
+                       int instances) {
+    model_pose(model);
+    Material *override = material_of(material);
+    for (int pass = 0; pass < 2; pass++)
+        for (int k = 0; k < model->node_count; k++) {
+            Node *n = &model->nodes[model->order[k]];
+            if (n->mesh < 0)
+                continue;
+            ModelMesh *mesh = &model->meshes[n->mesh];
+            bool skinned = n->skin >= 0 && model->skins[n->skin].count > 0;
+            bool joints_ready = false;
+            float matrix[16];
+            if (skinned) /* skinned vertices are placed by their joints, not by the node */
+                memcpy(matrix, base, sizeof matrix);
+            else
+                m4_multiply(matrix, base, n->world);
+            for (int p = mesh->first; p < mesh->first + mesh->count; p++) {
+                Primitive *primitive = &model->primitives[p];
+                Material *m = override ? override : material_of(primitive->material);
+                if ((m && m->blend && !A.shadow_pass) != (pass == 1))
+                    continue;
+                Mesh *gpu = mesh_of(primitive->mesh);
+                if (!gpu)
+                    continue;
+                if (skinned && gpu->skinned && !joints_ready) {
+                    Skin *skin = &model->skins[n->skin];
+                    static float joints[AP_MAX_JOINTS * 16];
+                    for (int j = 0; j < skin->count; j++)
+                        m4_multiply(joints + j * 16, model->nodes[skin->joints[j]].world,
+                                    skin->inverse_bind + j * 16);
+                    glBindTexture_(GL_TEXTURE_2D, A.joint_texture);
+                    glTexSubImage2D_(GL_TEXTURE_2D, 0, 0, 0, skin->count * 4, 1, GL_RGBA, GL_FLOAT,
+                                     joints);
+                    joints_ready = true;
+                }
+                Draw3 d = {matrix, white(), tint, true, instances > 0, skinned && gpu->skinned, m};
+                draw_mesh(gpu, &d, instances);
+            }
+        }
+}
+/* Draws a model like ap_mesh_draw; material 0 keeps the model's own materials. */
+void ap_model_draw(long id, long material, double x, double y, double z, double rx, double ry,
+                   double rz, double sx, double sy, double sz, long r, long g, long b, long a) {
+    if (!in3d())
+        return;
+    Model *model = model_or_fail(id);
+    if (!model)
+        return;
+    flush3();
+    AP_COLOR(color);
+    float base[16];
+    memcpy(base, A.model[A.model_depth], sizeof base);
+    placement(base, x, y, z, rx, ry, rz, sx, sy, sz);
+    draw_model(model, base, material, color, 0);
+}
+/* Draws a model once per matrix, like ap_mesh_draw_many (all in the same pose). */
+void ap_model_draw_many(long id, long material, const void *matrices, long count,
+                        const void *colors, long color_count, long r, long g, long b, long a) {
+    if (!in3d())
+        return;
+    Model *model = model_or_fail(id);
+    if (!model)
+        return;
+    flush3();
+    if (!matrices || !fill_instances((const double *)matrices, count, (const long long *)colors,
+                                     color_count))
+        return;
+    AP_COLOR(color);
+    float identity[16];
+    m4_identity(identity);
+    draw_model(model, identity, material, color, (int)count);
 }
 
 /* --- Audio --------------------------------------------------------------------------------- */

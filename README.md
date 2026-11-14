@@ -1,8 +1,9 @@
 # Aperture
 
 2D and 3D games in [Flywheel](https://github.com/pmorphia/flywheel): a window, input, shapes,
-sprites, text, cameras, meshes with lighting, render targets, shaders, and sound, drawn with
-OpenGL through SDL3.
+sprites, text, cameras, meshes and glTF models with skeletal animation, physically based
+materials, shadows, instancing, render targets, shaders, and sound, drawn with OpenGL through
+SDL3.
 
 ```flywheel
 import aperture as ap
@@ -28,8 +29,8 @@ flywheel game.fw                # or: flywheel --build game.fw -O3 -o game
 - Flywheel 2.21 (beta-21) or newer: Aperture uses structs, native handles, `// flywheel:`
   build directives, and the built-in `vecmath` module.
 - SDL 3.2 or newer with its development files, found through `pkg-config sdl3` (Arch:
-  `sdl3`; Debian/Ubuntu: `libsdl3-dev`; Fedora: `SDL3-devel`). PNG images and screenshots
-  need SDL 3.4; older versions load and save BMP.
+  `sdl3`; Debian/Ubuntu: `libsdl3-dev`; Fedora: `SDL3-devel`). Images (PNG, JPEG, BMP, TGA)
+  load with any of them; PNG screenshots need SDL 3.4 (older versions save BMP).
 - An OpenGL 3.3 driver.
 - Only for `import aperture.ttf`: FreeType (`pkg-config freetype2`).
 
@@ -179,9 +180,11 @@ end
 |---|---|
 | `Camera3D(position, target, up, fov = 60, near, far)` | a view; `fov <= 0` is a flat (orthographic) view `-fov` units tall. `orbit(target, yaw, pitch, distance)` and `look(position, yaw, pitch)` build cameras for orbiting and first-person views |
 | `cube`, `sphere`, `plane`, `cylinder`, `cone`, `torus` | built-in meshes |
-| `load_mesh("model.obj")` | Wavefront OBJ models |
+| `load_mesh("model.obj")` | the geometry of a Wavefront OBJ file as one mesh (`load_model` keeps its materials) |
 | `MeshBuilder()` | your own meshes: `vertex(position, normal, uv)`, `triangle`, `quad`, `color`, `smooth`, `build` |
-| `draw(mesh, position, tint, rotation, size, texture)` | draw a mesh; rotation is degrees around x, y, z |
+| `draw(mesh, position, tint, rotation, size, texture, material)` | draw a mesh; rotation is degrees around x, y, z |
+| `draw_material(mesh, material, position, rotation, size, tint)` | draw a mesh with a material |
+| `draw_many(mesh, transforms, material, colors, tint, texture)`, `transform(position, rotation, size)` | instancing: one call draws a mesh at every `Mat4` in a list, each tinted by its own color when `colors` has one per transform |
 | `push_3d()`, `translate_3d`, `rotate_3d(degrees, axis)`, `scale_3d`, `pop_3d()` | nested transforms |
 | `ambient(color)`, `sun(direction, color)`, `light(index, position, color, range)`, `light_off(index)`, `lighting(on)`, `shine(strength, tightness)` | lights: ambient, one directional, eight point lights, highlights |
 | `fog(color, start, finish)`, `no_fog()` | distance fog |
@@ -189,6 +192,93 @@ end
 | `wireframe(on)`, `cull(on)`, `depth_write(on)` | render state |
 | `project(point)`, `visible(point)`, `screen_ray(position)` | where a point appears on screen; the ray under the mouse |
 | `Ray.hits_sphere`, `hits_box`, `hits_plane`; `boxes_overlap`, `spheres_overlap` | picking and collisions |
+
+### Models and animation
+
+`load_model(path)` reads glTF 2.0 (`.gltf` with its buffers and images, or a single `.glb`)
+and Wavefront OBJ with its MTL materials. A model keeps its node tree, meshes, materials, and
+textures; glTF models also keep their skins (skeletal meshes, up to 256 joints and four per
+vertex) and animations.
+
+```flywheel
+var hero = ap.load_model("hero.glb")
+print(hero.animations())                   # ["Idle", "Walk", "Run"]
+
+while ap.frame() do
+    hero.play("Walk", ap.time())           # pose it as the clip is that far in
+    hero.blend("Run", ap.time(), speed)    # and mix another in (0 to 1)
+    ap.begin_3d(camera)
+    ap.draw_model(hero, position, ap.WHITE, ap.Vec3(0, heading, 0))
+    var hand = hero.node_transform("hand_r")
+    ap.draw(sword, position + hand.transform_point(ap.Vec3(0, 0, 0)))
+    ap.end_3d()
+end
+```
+
+| | |
+|---|---|
+| `draw_model(model, position, tint, rotation, size, material)` | draw in the current pose; a material replaces the model's own |
+| `draw_model_many(model, transforms, colors, tint, material)` | instancing, all in the same pose |
+| `play(name, time, loop = true)`, `blend(name, time, weight, loop)`, `rest()` | pose from animations: linear, step, and cubic spline keys for translation, rotation, and scale |
+| `animations()`, `has_animation(name)`, `length(name)` | its clips |
+| `nodes()`, `node_transform(name)`, `node_position(name)`, `node_rotation(name)` | its parts and bones, in the current pose, for attaching things |
+| `turn_node(name, quat)`, `move_node(name, position)` | pose a node by hand after `play`: a head that looks at the player |
+| `materials()`, `triangles()`, `low()`, `high()`, `size()` | its materials (to change) and its size |
+
+glTF features read: every accessor type (normalized and sparse included), interleaved
+buffers, data URIs, triangle strips and fans, node matrices or translation, rotation, and
+scale, the default scene, metallic-roughness materials with all five texture maps, samplers,
+alpha modes, double-sided materials, `KHR_materials_emissive_strength`, and
+`KHR_materials_unlit`. Not read: morph targets, cameras, lights, texture coordinate sets
+other than the first, compressed meshes (Draco, meshopt), and KTX2/WebP textures. A file
+that requires an extension that is not read fails to load with its name.
+
+### Materials
+
+A `Material` lights a surface physically (metallic-roughness, in linear color): a base color
+and texture, `metallic` 0 to 1, `roughness` 0 to 1, and optional maps.
+
+```flywheel
+var gold = ap.Material(ap.hex("#ffc850"), 1, 0.3)            # color, metallic, roughness
+var bricks = ap.Material(ap.WHITE, 0, 0.85, ap.load_texture("bricks.jpg"))
+bricks.normal_map(ap.load_texture("bricks_normal.png"))
+ap.draw_material(ap.cube(), bricks, ap.Vec3(0, 0.5, 0))
+```
+
+| | |
+|---|---|
+| `color(c)`, `surface(metallic, roughness)`, `texture(t)` | the base |
+| `normal_map(t, strength)` | tangent-space normal map (OpenGL convention, green up); tangents come from the model or are computed |
+| `surface_map(t)` | roughness in green, metallic in blue (glTF's layout) |
+| `glow(color, strength)`, `glow_map(t)` | light of its own |
+| `occlusion_map(t)` | ambient occlusion in red |
+| `cutoff(alpha)`, `transparent(on)`, `two_sided(on)`, `unlit(on)` | cut-outs, see-through surfaces (drawn after opaque ones), back faces, no lighting |
+
+Meshes drawn without a material keep the simpler lighting (`shine` sets their highlights).
+Materials from MTL files use `Kd`, `d`/`Tr`, `Ns` (as roughness), `Ke`, the PBR extension's
+`Pr` and `Pm`, and the `map_Kd`, `map_Bump`/`norm`, `map_Ke`, and `map_Pr` textures.
+
+### Shadows
+
+The sun casts shadows through a shadow map. `scene_3d(camera, scene, radius)` draws a scene
+function twice, into the shadow map around the camera's target and then through the camera:
+
+```flywheel
+ap.shadows(true)                            # resolution 2048, strength 0.75
+while ap.frame() do
+    ap.clear(ap.SKY)
+    ap.scene_3d(camera, function()
+        if not ap.casting_shadows() do      # the ground casts none
+            ap.draw(ground, ap.Vec3(0, 0, 0))
+        end
+        ap.draw_model(hero, position)
+    end, 20)
+end
+```
+
+`begin_shadows(center, radius)` ... `end_shadows()` draws the shadow map by hand, before
+`begin_3d`. Shadows fall within `radius` of the center: smaller is sharper. Lines and
+billboards cast no shadows, and cut-out materials leave holes in them.
 
 ## Sound
 
@@ -220,6 +310,8 @@ flywheel examples/sparkwell.fw    # a small arcade game
 flywheel examples/platformer.fw   # a tile map, jumps with coyote time, a following camera
 flywheel examples/shooter.fw      # a top-down shooter: waves, aiming, many bullets
 flywheel examples/gallery.fw      # a lit 3D scene with picking
+flywheel examples/showroom.fw     # shadows, materials, a forest of instances; add -- model.glb
+flywheel examples/skyhop.fw       # a 3D platformer: islands, moving platforms, crystals to find
 ```
 
 `flywheel --new --game NAME` (or `pulley new NAME --game`) starts a project with Aperture as a
@@ -239,12 +331,14 @@ flywheel --test tests/
 SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy flywheel --test tests/    # with no display
 ```
 
-The tests open a hidden window, draw, and read the pixels back.
+The tests open a hidden window, draw, and read the pixels back. `tests/models/` holds small
+glTF, GLB, and OBJ files written by `tools/test_models.py`.
 
 ## Notes
 
 - One window at a time; drawing calls belong to the thread that opened it.
 - A file in your project named like a module Aperture imports (`math.fw`, `gc.fw`) takes
   its place, as for any Flywheel import; rename the file.
-- `native/backend.c` is the whole renderer; `native/font5x7.h` is generated by
-  `tools/font.py`.
+- `native/backend.c` is the renderer; `native/model.h` reads glTF and OBJ models;
+  `native/stb_image.h` (v2.32, public domain) decodes images; `native/font5x7.h` is generated
+  by `tools/font.py`.
