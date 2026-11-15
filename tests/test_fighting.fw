@@ -1,0 +1,352 @@
+# Fixed steps, input history, frame data, hitstop, shake, debug drawing, and Ogg audio.
+# flywheel --test tests/ (SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy without a display)
+import "../aperture.fw" as ap
+import fs
+import math
+import testing
+
+function setup_all
+    ap.open("fighting tests", 320, 200, ap.HIDDEN + ap.NO_VSYNC)
+end
+function teardown_all
+    ap.fixed_delta(0)
+    ap.close()
+end
+
+private function close_to(double actual, double expected, double tolerance = 0.0001) returns bool
+    return math.abs(actual - expected) <= tolerance
+end
+# Runs frames and counts the ticks of a rate.
+private function run_ticks(int frames, int rate) returns int
+    var count = 0
+    for i in 0..<frames do
+        ap.frame()
+        while ap.tick(rate) do
+            count += 1
+        end
+    end
+    return count
+end
+
+function test_ticks_follow_time_not_frames
+    ap.fixed_delta(1.0 / 60)
+    testing.assert_equal(run_ticks(60, 60), 60)
+    # Frames twice as fast as ticks: one tick every other frame.
+    ap.fixed_delta(1.0 / 120)
+    testing.assert_equal(run_ticks(120, 60), 60)
+    # Frames slower than ticks: several ticks a frame, each with the fixed step.
+    ap.fixed_delta(1.0 / 30)
+    ap.frame()
+    var steps = 0
+    while ap.tick(60) do
+        testing.assert(close_to(ap.delta(), 1.0 / 60))
+        testing.assert(ap.ticking())
+        steps += 1
+    end
+    testing.assert_equal(steps, 2)
+    testing.assert(not ap.ticking())
+    testing.assert(close_to(ap.delta(), 1.0 / 30))
+    ap.fixed_delta(1.0 / 60)
+end
+
+function test_a_press_lands_on_one_tick
+    ap.fixed_delta(1.0 / 240)
+    ap.send_key(ap.KEY_J, true)
+    var presses = 0
+    var ticks = 0
+    for i in 0..<16 do
+        ap.frame()
+        while ap.tick(60) do
+            ticks += 1
+            if ap.key_pressed(ap.KEY_J) do
+                presses += 1
+            end
+            testing.assert(ap.key_down(ap.KEY_J))
+        end
+    end
+    ap.send_key(ap.KEY_J, false)
+    ap.frame()
+    testing.assert_equal(ticks, 4)
+    testing.assert_equal(presses, 1)
+    ap.fixed_delta(1.0 / 60)
+end
+
+function test_alpha_and_tick_count
+    ap.fixed_delta(1.0 / 90)
+    ap.frame()
+    var before = ap.tick_count()
+    while ap.tick(60) do
+    end
+    testing.assert(ap.alpha() >= 0 and ap.alpha() <= 1)
+    testing.assert(ap.tick_count() >= before)
+    testing.assert(close_to(ap.step(), 1.0 / 60))
+    ap.fixed_delta(1.0 / 60)
+end
+
+private function fighter() returns ap.Inputs
+    var p = ap.Inputs(60)
+    p.button("lp", ap.KEY_U)
+    p.button("hp", ap.KEY_O, ap.PAD_NORTH)
+    return p
+end
+private function feed(ap.Inputs p, string directions, int buttons = 0)
+    for c in directions.chars() do
+        p.feed(int(string(c)), buttons)
+    end
+end
+
+function test_motions
+    var p = fighter()
+    feed(p, "5552365")
+    testing.assert(p.motion("236"))
+    testing.assert(not p.motion("214"))
+    testing.assert(not p.motion("623"))
+    testing.assert(not p.motion("236", 2))
+    feed(p, "6236")
+    testing.assert(p.motion("623"))
+    # Facing left mirrors the directions: the same stick motion is now 214.
+    var q = fighter()
+    feed(q, "5214")
+    testing.assert(not q.motion("236"))
+    q.face(-1)
+    testing.assert(q.motion("236"))
+    testing.assert_equal(q.direction(), 6)
+    testing.assert(q.holding("6"))
+    # Old motions fall out of the window.
+    var r = fighter()
+    feed(r, "236" + "5555555555555555555")
+    testing.assert(not r.motion("236"))
+    testing.assert(r.motion("236", 30))
+end
+
+function test_buttons_buffer_and_consume
+    var p = fighter()
+    p.feed(5, 0)
+    p.feed(5, 1)
+    testing.assert(p.pressed("lp"))
+    testing.assert(p.held("lp"))
+    testing.assert(not p.pressed("hp"))
+    p.feed(5, 1 + 2)
+    testing.assert(not p.pressed("lp"))
+    testing.assert(p.pressed("hp"))
+    p.feed(5, 0)
+    testing.assert(p.released("lp") and p.released("hp"))
+    # A press three ticks ago is still buffered, until consumed.
+    p.feed(5, 0)
+    p.feed(5, 0)
+    testing.assert(p.buffered("hp", 5))
+    testing.assert(not p.buffered("hp", 3))
+    p.consume("hp")
+    testing.assert(not p.buffered("hp", 5))
+    p.feed(5, 2)
+    testing.assert(p.buffered("hp"))
+    testing.expect_error(KeyError, function() => p.pressed("kick"))
+end
+
+function test_charge_and_double_tap
+    var p = fighter()
+    for i in 0..<45 do
+        p.feed(1, 0)
+    end
+    testing.assert(p.charged("4", 45))
+    testing.assert(p.charged("2", 45))
+    testing.assert_equal(p.held_for("4"), 45)
+    feed(p, "6")
+    testing.assert(p.charged("4", 45))
+    feed(p, "66666666")
+    testing.assert(not p.charged("4", 45))
+    var d = fighter()
+    feed(d, "5556")
+    testing.assert(not d.double_tap("6"))
+    feed(d, "556")
+    testing.assert(d.double_tap("6"))
+    feed(d, "6")
+    testing.assert(not d.double_tap("6"))
+    var slow = fighter()
+    feed(slow, "6" + "5555555555555" + "6")
+    testing.assert(not slow.double_tap("6", 12))
+end
+
+function test_codes_round_trip
+    var p = fighter()
+    p.feed(3, 2)
+    var q = fighter()
+    q.feed_code(p.code())
+    testing.assert_equal(q.code(), 23)
+    testing.assert(q.held("hp") and not q.held("lp"))
+    testing.assert_equal(q.direction(), 3)
+    testing.assert_equal(p.lines(1).join("|"), "1 3 hp")
+end
+
+function test_devices_through_update
+    var p = fighter()
+    ap.fixed_delta(1.0 / 60)
+    ap.send_key(ap.KEY_S, true)
+    ap.send_key(ap.KEY_D, true)
+    ap.send_key(ap.KEY_U, true)
+    ap.frame()
+    p.update()
+    testing.assert_equal(p.direction(), 3)
+    testing.assert(p.pressed("lp"))
+    # Left and right together cancel.
+    ap.send_key(ap.KEY_A, true)
+    ap.frame()
+    p.update()
+    testing.assert_equal(p.direction(), 2)
+    for key in [ap.KEY_S, ap.KEY_D, ap.KEY_U, ap.KEY_A] do
+        ap.send_key(key, false)
+    end
+    ap.frame()
+    p.update()
+    testing.assert_equal(p.direction(), 5)
+end
+
+private string frames_path = fs.join(fs.temp_dir(), "aperture-test.frames.toml")
+
+private function write_frames(int startup)
+    var lines = [
+        "[jab]",
+        "damage = 30",
+        "hitbox = [{ from = {startup}, to = 7, box = [20, -60, 40, 20], hitstun = 12 }]",
+        "hurtbox = [{ from = 1, to = 18, box = [-20, -90, 40, 90] }]",
+        "cancel = [{ from = 6, to = 12, into = [\"special\"] }]",
+        "invincible = [1, 3]",
+        "markers = { sound = 5, step = [3, 9] }",
+        "",
+        "[walk]",
+        "loop = true",
+        "frames = 4"
+    ]
+    fs.write(frames_path, lines.join("\n") + "\n")
+end
+
+function test_frame_data
+    write_frames(5)
+    var data = ap.load_frames(frames_path)
+    var jab = data.move("jab")
+    testing.assert_equal(jab.frames, 18)
+    testing.assert_equal(jab.startup(), 5)
+    testing.assert(not jab.active(4))
+    testing.assert(jab.active(5) and jab.active(7))
+    testing.assert(not jab.active(8))
+    testing.assert_equal(jab.hitboxes(6)[0].value("hitstun"), 12.0)
+    testing.assert_equal(jab.value("damage"), 30.0)
+    testing.assert_equal(jab.hurtboxes(10).length, 1)
+    testing.assert(jab.can_cancel(8, "special"))
+    testing.assert(not jab.can_cancel(8, "super"))
+    testing.assert(not jab.can_cancel(13, "special"))
+    testing.assert(jab.in_window("invincible", 2))
+    testing.assert(not jab.in_window("invincible", 4))
+    testing.assert(jab.at("step", 9) and jab.at("sound", 5) and not jab.at("sound", 6))
+    testing.assert_equal(jab.marker("step"), 3)
+    testing.assert(jab.done(18) and not jab.done(17))
+    # Boxes mirror for a character facing left.
+    var box = jab.hitboxes(5)[0]
+    var right = box.placed(ap.Vec2(100, 200), 1)
+    var left = box.placed(ap.Vec2(100, 200), -1)
+    testing.assert_equal(right.x, 120.0)
+    testing.assert_equal(left.x, 40.0)
+    testing.assert_equal(left.y, 140.0)
+    var walk = data.move("walk")
+    testing.assert_equal(walk.next(4), 1)
+    testing.assert(not walk.done(4))
+    # Reloading changes the move in place, and a broken file keeps the last good data.
+    write_frames(3)
+    testing.assert(data.reload())
+    testing.assert_equal(jab.startup(), 3)
+    fs.write(frames_path, "[jab\nbroken")
+    testing.assert(not data.reload())
+    testing.assert_equal(jab.startup(), 3)
+    testing.assert(data.error != "")
+    testing.assert(data.has("walk") and not data.has("kick"))
+    fs.remove(frames_path)
+end
+
+function test_hitstop_and_shake
+    ap.fixed_delta(1.0 / 60)
+    ap.hitstop(3)
+    var frozen = 0
+    for i in 0..<6 do
+        ap.frame()
+        while ap.tick(60) do
+            if ap.frozen() do
+                frozen += 1
+            end
+        end
+    end
+    testing.assert_equal(frozen, 3)
+    testing.assert(not ap.frozen())
+    ap.shake(10, 4)
+    ap.frame()
+    var moved = false
+    var ticks = 0
+    while ticks < 6 do
+        ap.frame()
+        while ap.tick(60) do
+            ticks += 1
+            var o = ap.shake_offset()
+            testing.assert(o.length() <= 10 * 1.5)
+            if o.length() > 0 do
+                moved = true
+            end
+        end
+    end
+    testing.assert(moved)
+    testing.assert_equal(ap.shake_offset().length(), 0.0)
+    ap.shaking(false)
+    ap.shake(10, 4)
+    testing.assert_equal(ap.shake_offset().length(), 0.0)
+    ap.shaking(true)
+end
+
+function test_debug_drawing
+    ap.frame()
+    testing.assert(not ap.debugging())
+    ap.debug(true)
+    ap.debug_text("hello")
+    var p = fighter()
+    p.feed(6, 1)
+    ap.debug_inputs("p1", p)
+    ap.debug_rect(ap.Rect(1, 1, 5, 5))
+    ap.frame()
+    ap.debug(false)
+    ap.debug_toggle_key(ap.KEY_F2)
+    ap.send_key(ap.KEY_F2, true)
+    ap.frame()
+    testing.assert(ap.debugging())
+    ap.send_key(ap.KEY_F2, false)
+    ap.frame()
+    ap.debug(false)
+    ap.debug_toggle_key(ap.KEY_F1)
+end
+
+private function audio_file() returns string
+    for place in ["tests/audio/", "audio/", "aperture/tests/audio/"] do
+        if fs.exists(place + "beep.ogg") do
+            return place + "beep.ogg"
+        end
+    end
+    return "tests/audio/beep.ogg"
+end
+
+function test_ogg_sound_and_music
+    var path = audio_file()
+    var beep = ap.load_sound(path)
+    testing.assert(close_to(beep.seconds(), 0.5, 0.02))
+    if not ap.has_audio() do
+        return
+    end
+    ap.master_volume(0)
+    testing.assert(ap.play_music(path, 0.5, false))
+    testing.assert(ap.music_playing())
+    testing.assert(close_to(ap.music_length(), 0.5, 0.02))
+    ap.seek_music(0.25)
+    ap.pause_music()
+    ap.pause_music(false)
+    ap.music_volume(0.2)
+    ap.stop_music()
+    testing.assert(not ap.music_playing())
+    testing.assert(ap.play_music(path))
+    ap.stop_music()
+    ap.master_volume(1)
+end

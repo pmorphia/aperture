@@ -1,0 +1,44 @@
+# Frame data for examples/fighter.fw. Edit and save while the game runs: the moves change on
+# the next frame. Boxes are [x, y, width, height] from the fighter's feet, facing right.
+
+[idle]
+loop = true
+frames = 1
+hurtbox = [{ from = 1, to = 1, box = [-14, -70, 28, 70] }]
+
+[walk]
+loop = true
+frames = 1
+hurtbox = [{ from = 1, to = 1, box = [-14, -70, 28, 70] }]
+
+[jab]
+damage = 40
+frames = 16
+hitbox = [{ from = 4, to = 6, box = [14, -56, 30, 10], hitstun = 14, hitstop = 6, shake = 2 }]
+hurtbox = [{ from = 1, to = 16, box = [-14, -70, 28, 70] }, { from = 4, to = 8, box = [14, -58, 22, 14] }]
+cancel = [{ from = 4, to = 10, into = ["special"] }]
+
+[strong]
+damage = 90
+frames = 30
+hitbox = [{ from = 9, to = 12, box = [14, -50, 46, 18], hitstun = 22, hitstop = 11, shake = 6 }]
+hurtbox = [{ from = 1, to = 30, box = [-14, -70, 28, 70] }, { from = 9, to = 18, box = [14, -52, 40, 20] }]
+markers = { lunge = 8 }
+
+[burst]
+damage = 120
+frames = 40
+hitbox = [{ from = 12, to = 18, box = [10, -64, 80, 40], hitstun = 30, hitstop = 14, shake = 10 }]
+hurtbox = [{ from = 1, to = 40, box = [-14, -70, 28, 70] }]
+invincible = [1, 11]
+markers = { flash = 12 }
+
+[dash]
+frames = 14
+hurtbox = [{ from = 1, to = 14, box = [-14, -64, 28, 64] }]
+markers = { go = 2 }
+
+[hurt]
+frames = 1
+loop = true
+hurtbox = [{ from = 1, to = 1, box = [-16, -66, 28, 66] }]

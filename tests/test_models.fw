@@ -339,6 +339,15 @@ function test_skinning_and_animation
     testing.assert_equal(bend.length("Lift"), 0.5)
     testing.expect_error(ValueError, function() => bend.play("Fly", 0))
     testing.expect_error(ValueError, function() => bend.node_position("tail"))
+    # Frame data in the animations' glTF extras.
+    var frames = bend.frame_data()
+    testing.assert(frames.has("Bend") and not frames.has("Lift"))
+    var swing = frames.move("Bend")
+    testing.assert_equal(swing.frames, 60)
+    testing.assert_equal(swing.startup(), 20)
+    testing.assert_equal(swing.hitboxes(22)[0].value("damage"), 40.0)
+    testing.assert(swing.at("swish", 18))
+    testing.assert_equal(swing.seconds(31), 0.5)
 
     var camera = ap.Camera3D(ap.Vec3(0, 1, 6), ap.Vec3(0, 1, 0))
     ap.begin_3d(camera)

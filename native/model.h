@@ -37,6 +37,7 @@ typedef struct {
 } Channel;
 typedef struct {
     char *name;
+    char *extras; /* the animation's "extras" as JSON text (frame data), or NULL */
     Channel *channels;
     int channel_count;
     float length;
@@ -75,6 +76,7 @@ static void model_release(Model *model) {
         }
         free(model->clips[i].channels);
         free(model->clips[i].name);
+        free(model->clips[i].extras);
     }
     free(model->nodes);
     free(model->order);
@@ -1016,6 +1018,62 @@ static bool gltf_skins(Gltf *g) {
     }
     return true;
 }
+/* JSON text of a parsed value, for handing a part of the file (such as extras) to Flywheel. */
+typedef struct {
+    char *text;
+    size_t length, capacity;
+} JsonText;
+static void json_put(JsonText *out, const char *text, size_t length) {
+    if (out->length + length + 1 > out->capacity) {
+        out->capacity = (out->length + length + 1) * 2;
+        out->text = realloc(out->text, out->capacity);
+    }
+    memcpy(out->text + out->length, text, length);
+    out->length += length;
+    out->text[out->length] = 0;
+}
+static void json_put_string(JsonText *out, const char *s) {
+    json_put(out, "\"", 1);
+    for (; s && *s; s++) {
+        char escaped[8];
+        if (*s == '"' || *s == '\\') {
+            escaped[0] = '\\', escaped[1] = *s;
+            json_put(out, escaped, 2);
+        } else if ((unsigned char)*s < 32) {
+            snprintf(escaped, sizeof escaped, "\\u%04x", (unsigned char)*s);
+            json_put(out, escaped, 6);
+        } else
+            json_put(out, s, 1);
+    }
+    json_put(out, "\"", 1);
+}
+static void json_write(JsonText *out, const Json *j) {
+    char number[40];
+    switch (j->type) {
+    case JSON_FALSE: json_put(out, "false", 5); break;
+    case JSON_TRUE: json_put(out, "true", 4); break;
+    case JSON_NUMBER:
+        snprintf(number, sizeof number, "%.17g", j->number);
+        json_put(out, number, strlen(number));
+        break;
+    case JSON_STRING: json_put_string(out, j->string); break;
+    case JSON_ARRAY:
+    case JSON_OBJECT:
+        json_put(out, j->type == JSON_ARRAY ? "[" : "{", 1);
+        for (int i = 0; i < j->count; i++) {
+            if (i)
+                json_put(out, ",", 1);
+            if (j->type == JSON_OBJECT) {
+                json_put_string(out, j->items[i].key);
+                json_put(out, ":", 1);
+            }
+            json_write(out, &j->items[i]);
+        }
+        json_put(out, j->type == JSON_ARRAY ? "]" : "}", 1);
+        break;
+    default: json_put(out, "null", 4);
+    }
+}
 static bool gltf_animations(Gltf *g) {
     const Json *animations = gltf_array(g, "animations");
     Model *m = g->model;
@@ -1028,6 +1086,11 @@ static bool gltf_animations(Gltf *g) {
         char fallback[32];
         snprintf(fallback, sizeof fallback, "animation %d", i);
         clip->name = copy_string(name ? name : fallback, strlen(name ? name : fallback));
+        if (json_get(source, "extras")) {
+            JsonText extras = {0};
+            json_write(&extras, json_get(source, "extras"));
+            clip->extras = extras.text;
+        }
         const Json *channels = json_get(source, "channels"), *samplers = json_get(source, "samplers");
         clip->channels = calloc((size_t)json_count(channels) + 1, sizeof(Channel));
         for (int k = 0; k < json_count(channels); k++) {

@@ -116,7 +116,10 @@ def bend():
         "skins": [{"joints": [1, 2], "inverseBindMatrices": inverse_bind}],
         "animations": [
             {"name": "Bend", "channels": [{"sampler": 0, "target": {"node": 2, "path": "rotation"}}],
-             "samplers": [{"input": times, "output": rotations}]},
+             "samplers": [{"input": times, "output": rotations}],
+             "extras": {"frames": 60, "hitbox": [{"from": 20, "to": 24, "box": [0, -2, 1, 1],
+                                                  "damage": 40}],
+                        "markers": {"swish": 18}}},
             {"name": "Lift", "channels": [{"sampler": 0, "target": {"node": 0, "path": "translation"}}],
              "samplers": [{"input": lift_times, "output": lifts, "interpolation": "STEP"}]},
         ],

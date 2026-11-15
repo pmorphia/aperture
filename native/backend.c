@@ -44,6 +44,21 @@
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic pop
 #endif
+/* Ogg Vorbis (stb_vorbis v1.24, public domain): .ogg sounds and streamed music. */
+#define STB_VORBIS_NO_PUSHDATA_API
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#pragma GCC diagnostic ignored "-Wsign-compare"
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+#pragma GCC diagnostic ignored "-Wunused-value"
+#pragma GCC diagnostic ignored "-Wunused-variable"
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+#endif
+#include "stb_vorbis.h"
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 
 void fw_foreign_fail(const char *message);
@@ -904,6 +919,7 @@ static void refresh_size(void) {
         A.height = 1;
 }
 static void audio_close(void);
+void ap_music_stop(void);
 static void build_font(void);
 static void model_release(struct Model *model);
 
@@ -1211,6 +1227,11 @@ static void present(void) {
             SDL_DelayPrecise((Uint64)((budget - spent) * 1e9));
     }
 }
+/* Seconds every frame counts as, whatever it really took (0: the real time). */
+static double fixed_delta = 0;
+void ap_fixed_delta(double seconds) {
+    fixed_delta = seconds > 0 ? seconds : 0;
+}
 /* Starts a frame: presents the previous one, reads input, and advances the clock. Returns
    false once the window should close. */
 bool ap_frame(void) {
@@ -1234,8 +1255,14 @@ bool ap_frame(void) {
         A.delta = A.target_fps > 0 ? 1.0 / A.target_fps : 1.0 / 60.0;
     if (A.delta > 0.25)
         A.delta = 0.25; /* a stall (a breakpoint, a dragged window) is not one long step */
+    /* Unattended runs are deterministic: every frame is exactly one frame at the target rate,
+       however fast the machine draws, so ticks and timers give the same result every run. */
+    bool fixed = (limit && *limit) || fixed_delta > 0;
+    if (fixed)
+        A.delta = fixed_delta > 0 ? fixed_delta : A.target_fps > 0 ? 1.0 / A.target_fps : 1.0 / 60.0;
     A.last_ticks = now;
-    A.time = (double)(now - A.start_ticks) / (double)SDL_GetPerformanceFrequency();
+    A.time = fixed ? A.time + A.delta
+                             : (double)(now - A.start_ticks) / (double)SDL_GetPerformanceFrequency();
     double instant = A.delta > 0 ? 1.0 / A.delta : 0;
     A.fps = A.frames == 0 ? instant : A.fps * 0.9 + instant * 0.1;
     A.frames++;
@@ -1333,6 +1360,49 @@ void ap_show_cursor(bool on) {
 void ap_capture_mouse(bool on) {
     if (ready())
         SDL_SetWindowRelativeMouseMode(A.window, on);
+}
+
+/* When a file last changed, in seconds (an arbitrary epoch), or -1 when it cannot be read:
+   for reloading frame data and other assets while the game runs. */
+double ap_file_time(const char *path) {
+    SDL_PathInfo info;
+    if (!SDL_GetPathInfo(path, &info) || info.type != SDL_PATHTYPE_FILE)
+        return -1;
+    return (double)info.modify_time / 1e9;
+}
+
+/* --- Ticks -------------------------------------------------------------------------------- */
+/* During a fixed-step tick (aperture.tick), "pressed" and "released" compare with the input of
+   the previous tick instead of the previous frame: a press lands on exactly one tick, however
+   many ticks a frame runs (none, when frames are faster than ticks; several, when slower). */
+static struct {
+    bool ticking;
+    bool keys[AP_KEYS], frame_keys[AP_KEYS];
+    bool pad[AP_MAX_GAMEPADS][SDL_GAMEPAD_BUTTON_COUNT];
+    bool frame_pad[AP_MAX_GAMEPADS][SDL_GAMEPAD_BUTTON_COUNT];
+    unsigned buttons, frame_buttons;
+} T;
+void ap_tick_begin(void) {
+    if (T.ticking)
+        return;
+    memcpy(T.frame_keys, A.previous_keys, sizeof T.frame_keys);
+    memcpy(A.previous_keys, T.keys, sizeof T.keys);
+    memcpy(T.frame_pad, A.previous_pad_buttons, sizeof T.frame_pad);
+    memcpy(A.previous_pad_buttons, T.pad, sizeof T.pad);
+    T.frame_buttons = A.previous_buttons;
+    A.previous_buttons = T.buttons;
+    T.ticking = true;
+}
+void ap_tick_end(void) {
+    if (!T.ticking)
+        return;
+    memcpy(T.keys, A.keys, sizeof T.keys);
+    memcpy(A.previous_keys, T.frame_keys, sizeof T.frame_keys);
+    memcpy(T.pad, A.pad_buttons, sizeof T.pad);
+    memcpy(A.previous_pad_buttons, T.frame_pad, sizeof T.frame_pad);
+    T.buttons = A.buttons;
+    A.previous_buttons = T.frame_buttons;
+    T.ticking = false;
 }
 
 /* --- Input --------------------------------------------------------------------------------- */
@@ -2057,15 +2127,16 @@ void ap_shader_free(long id) {
 }
 
 /* --- Text ---------------------------------------------------------------------------------- */
-/* The built-in font: every glyph in a 6x8 cell of a 96x48 atlas. */
+/* The built-in font: every glyph in a 6x10 cell of a 96x60 atlas. Glyphs are 9 rows, but the
+   font is 8 pixels tall (7 rows of letter and a gap) so descenders hang below the line. */
 static void build_font(void) {
-    enum { cell_w = 6, cell_h = 8, columns = 16, rows = 6 };
+    enum { cell_w = 6, cell_h = 10, columns = 16, rows = 6, height = 8 };
     unsigned char *atlas = calloc(cell_w * columns * cell_h * rows, 4);
     Font *font = &A.fonts[0];
     memset(font, 0, sizeof *font);
     for (int index = 0; index < 95; index++) {
         int ox = index % columns * cell_w, oy = index / columns * cell_h;
-        for (int y = 0; y < 7; y++)
+        for (int y = 0; y < 9; y++)
             for (int x = 0; x < 5; x++)
                 if (ap_font5x7[index][y] >> (4 - x) & 1) {
                     unsigned char *p = atlas + ((oy + y) * cell_w * columns + ox + x) * 4;
@@ -2073,13 +2144,13 @@ static void build_font(void) {
                 }
         Glyph *glyph = &font->glyphs[32 + index];
         glyph->x = (float)ox, glyph->y = (float)oy;
-        glyph->w = cell_w, glyph->h = cell_h;
+        glyph->w = cell_w, glyph->h = 9;
         glyph->advance = cell_w;
         glyph->present = true;
     }
     font->texture = texture_create(atlas, cell_w * columns, cell_h * rows, false);
-    font->pixel_size = cell_h;
-    font->line_height = cell_h + 2;
+    font->pixel_size = height;
+    font->line_height = height + 2;
     font->used = true;
     free(atlas);
 }
@@ -3411,6 +3482,13 @@ const char *ap_model_clip_name(long id, long clip) {
     Model *model = model_of(id);
     return model && clip >= 0 && clip < model->clip_count ? model->clips[clip].name : "";
 }
+/* The clip's glTF "extras" as JSON text ("" when it has none): where frame data can live. */
+const char *ap_model_clip_extras(long id, long clip) {
+    Model *model = model_of(id);
+    return model && clip >= 0 && clip < model->clip_count && model->clips[clip].extras
+               ? model->clips[clip].extras
+               : "";
+}
 double ap_model_clip_length(long id, long clip) {
     Model *model = model_of(id);
     return model && clip >= 0 && clip < model->clip_count ? model->clips[clip].length : 0;
@@ -3614,6 +3692,18 @@ void ap_model_draw_many(long id, long material, const void *matrices, long count
 }
 
 /* --- Audio --------------------------------------------------------------------------------- */
+/* The music track (see ap_music_play). */
+static struct {
+    SDL_AudioStream *stream;
+    stb_vorbis *vorbis;      /* .ogg, read from the file as it plays */
+    Uint8 *wav;              /* .wav, loaded whole */
+    Uint32 wav_length, wav_at;
+    SDL_AudioSpec spec;
+    bool loop, ended, paused;
+    float volume;
+    Sint64 decoded;          /* sample frames decoded since the start of the track */
+    Sint64 total;            /* sample frames in the track */
+} M;
 static bool audio_open(void) {
     if (A.audio)
         return true;
@@ -3623,6 +3713,7 @@ static bool audio_open(void) {
     return A.audio != 0;
 }
 static void audio_close(void) {
+    ap_music_stop();
     for (int i = 0; i < AP_MAX_VOICES; i++)
         if (A.voices[i].stream)
             SDL_DestroyAudioStream(A.voices[i].stream);
@@ -3654,7 +3745,30 @@ static int sound_slot(void) {
     fail("too many sounds (%d)", AP_MAX_SOUNDS - 1);
     return 0;
 }
-/* Loads a WAV file. */
+static bool ends_with(const char *text, const char *suffix) {
+    size_t n = strlen(text), m = strlen(suffix);
+    return n >= m && SDL_strcasecmp(text + n - m, suffix) == 0;
+}
+/* Decodes a whole .ogg file into 16-bit samples. */
+static bool load_ogg(const char *path, Sound *sound) {
+    int channels = 0, rate = 0;
+    short *samples = NULL;
+    int frames = stb_vorbis_decode_filename(path, &channels, &rate, &samples);
+    if (frames < 0 || !samples) {
+        SDL_SetError("not a readable Ogg Vorbis file");
+        return false;
+    }
+    size_t bytes = (size_t)frames * (size_t)channels * sizeof(short);
+    sound->data = SDL_malloc(bytes ? bytes : 1);
+    memcpy(sound->data, samples, bytes);
+    free(samples);
+    sound->length = (Uint32)bytes;
+    sound->spec.format = SDL_AUDIO_S16;
+    sound->spec.channels = channels;
+    sound->spec.freq = rate;
+    return true;
+}
+/* Loads a WAV or Ogg Vorbis (.ogg) file. */
 long ap_sound_load(const char *path) {
     if (!ready())
         return 0;
@@ -3662,7 +3776,8 @@ long ap_sound_load(const char *path) {
     if (!slot)
         return 0;
     Sound *sound = &A.sounds[slot];
-    if (!SDL_LoadWAV(path, &sound->spec, &sound->data, &sound->length)) {
+    if (ends_with(path, ".ogg") ? !load_ogg(path, sound)
+                                : !SDL_LoadWAV(path, &sound->spec, &sound->data, &sound->length)) {
         fail("cannot load sound '%s': %s", path, SDL_GetError());
         return 0;
     }
@@ -3806,9 +3921,144 @@ void ap_stop_all(void) {
 /* The volume of everything, 0 to 1; applies to sounds played after the call. */
 void ap_master_volume(double volume) {
     A.master_volume = (float)fmin(fmax(volume, 0), 1);
+    if (M.stream)
+        SDL_SetAudioStreamGain(M.stream, M.volume * A.master_volume);
 }
 bool ap_audio_available(void) {
     return A.open && audio_open();
+}
+/* --- Music: one track streamed from its file, decoded on the audio thread as it plays ------ */
+static void SDLCALL music_feed(void *userdata, SDL_AudioStream *stream, int additional, int total) {
+    (void)userdata;
+    (void)total;
+    short chunk[4096 * 2];
+    int channels = M.spec.channels, frame = channels * (int)sizeof(short), empty_passes = 0;
+    while (additional > 0 && !M.ended) {
+        int got = 0;
+        if (M.vorbis) {
+            int want = (int)(sizeof chunk / sizeof chunk[0]) / channels * channels;
+            got = stb_vorbis_get_samples_short_interleaved(M.vorbis, channels, chunk, want) * frame;
+            if (got > 0)
+                SDL_PutAudioStreamData(stream, chunk, got);
+        } else if (M.wav) {
+            Uint32 left = M.wav_length - M.wav_at;
+            got = (int)(left < (Uint32)additional ? left : (Uint32)additional);
+            if (got > 0)
+                SDL_PutAudioStreamData(stream, M.wav + M.wav_at, got);
+            M.wav_at += (Uint32)got;
+        }
+        if (got > 0) {
+            M.decoded += got / frame;
+            additional -= got;
+            empty_passes = 0;
+            continue;
+        }
+        if (!M.loop || ++empty_passes > 1) { /* the end (or an empty file) */
+            M.ended = true;
+            SDL_FlushAudioStream(stream);
+            break;
+        }
+        if (M.vorbis)
+            stb_vorbis_seek_start(M.vorbis);
+        M.wav_at = 0;
+        M.decoded = 0;
+    }
+}
+void ap_music_stop(void) {
+    if (M.stream)
+        SDL_DestroyAudioStream(M.stream);
+    if (M.vorbis)
+        stb_vorbis_close(M.vorbis);
+    SDL_free(M.wav);
+    memset(&M, 0, sizeof M);
+}
+/* Starts streaming a .ogg or .wav file as the music, replacing any playing. */
+bool ap_music_play(const char *path, double volume, bool loop) {
+    ap_music_stop();
+    if (!ready() || !audio_open())
+        return false;
+    if (ends_with(path, ".ogg")) {
+        int error = 0;
+        M.vorbis = stb_vorbis_open_filename(path, &error, NULL);
+        if (!M.vorbis) {
+            fail("cannot play music '%s': not a readable Ogg Vorbis file", path);
+            return false;
+        }
+        stb_vorbis_info info = stb_vorbis_get_info(M.vorbis);
+        M.spec.format = SDL_AUDIO_S16;
+        M.spec.channels = info.channels;
+        M.spec.freq = (int)info.sample_rate;
+        M.total = stb_vorbis_stream_length_in_samples(M.vorbis);
+    } else {
+        if (!SDL_LoadWAV(path, &M.spec, &M.wav, &M.wav_length)) {
+            fail("cannot play music '%s': %s", path, SDL_GetError());
+            memset(&M, 0, sizeof M);
+            return false;
+        }
+        M.total = M.wav_length / SDL_AUDIO_FRAMESIZE(M.spec);
+    }
+    M.loop = loop;
+    M.volume = (float)fmax(volume, 0);
+    M.stream = SDL_CreateAudioStream(&M.spec, NULL);
+    if (!M.stream || !SDL_BindAudioStream(A.audio, M.stream)) {
+        ap_music_stop();
+        return false;
+    }
+    SDL_SetAudioStreamGain(M.stream, M.volume * A.master_volume);
+    SDL_SetAudioStreamGetCallback(M.stream, music_feed, NULL);
+    return true;
+}
+bool ap_music_playing(void) {
+    if (!M.stream)
+        return false;
+    SDL_LockAudioStream(M.stream);
+    bool playing = !M.ended || SDL_GetAudioStreamQueued(M.stream) > 0;
+    SDL_UnlockAudioStream(M.stream);
+    return playing;
+}
+void ap_music_pause(bool paused) {
+    if (!M.stream || M.paused == paused)
+        return;
+    M.paused = paused;
+    if (paused)
+        SDL_UnbindAudioStream(M.stream);
+    else
+        SDL_BindAudioStream(A.audio, M.stream);
+}
+void ap_music_volume(double volume) {
+    M.volume = (float)fmax(volume, 0);
+    if (M.stream)
+        SDL_SetAudioStreamGain(M.stream, M.volume * A.master_volume);
+}
+/* Seconds into the track that are being heard (decoded, less what waits in the stream). */
+double ap_music_position(void) {
+    if (!M.stream || M.spec.freq <= 0)
+        return 0;
+    SDL_LockAudioStream(M.stream);
+    Sint64 heard = M.decoded - SDL_GetAudioStreamQueued(M.stream) / SDL_AUDIO_FRAMESIZE(M.spec);
+    SDL_UnlockAudioStream(M.stream);
+    if (heard < 0)
+        heard += M.total; /* just looped */
+    return (double)heard / M.spec.freq;
+}
+double ap_music_length(void) {
+    return M.stream && M.spec.freq > 0 ? (double)M.total / M.spec.freq : 0;
+}
+void ap_music_seek(double seconds) {
+    if (!M.stream)
+        return;
+    SDL_LockAudioStream(M.stream);
+    Sint64 frame = (Sint64)(fmax(seconds, 0) * M.spec.freq);
+    if (frame >= M.total)
+        frame = M.total > 0 ? M.total - 1 : 0;
+    if (M.vorbis)
+        stb_vorbis_seek(M.vorbis, (unsigned)frame);
+    else
+        M.wav_at = (Uint32)(frame * SDL_AUDIO_FRAMESIZE(M.spec));
+    M.decoded = frame;
+    M.ended = false;
+    SDL_ClearAudioStream(M.stream);
+    SDL_UnlockAudioStream(M.stream);
 }
 void ap_sound_free(long id) {
     if (id <= 0 || id >= AP_MAX_SOUNDS || !A.sounds[id].used)

@@ -13,7 +13,11 @@
 # colors are 0 to 255. Drawing happens between two calls of frame().
 import c native.backend as nat
 import gc
+import hot
 import math
+import fs
+import json
+import toml
 
 # --- Values ----------------------------------------------------------------------------------
 
@@ -207,6 +211,20 @@ const int MSAA = 16
 const int BORDERLESS = 32
 
 private double collector_budget = 0.001
+private double tick_accumulator = 0
+private double tick_step = 0
+private int tick_frame = -1
+private int tick_number = 0
+private int ticks_this_frame = 0
+private bool in_tick = false
+private int hitstop_left = 0
+private double shake_strength = 0
+private int shake_length = 0
+private int shake_left = 0
+private bool shake_on = true
+private bool debug_on = false
+private int debug_key = 58
+private string[] debug_lines = []
 
 # Opens the game window. Only one window is open at a time.
 function open(string title, int width, int height, int options = 0)
@@ -221,19 +239,163 @@ function is_open() returns bool
 end
 # Starts the next frame: shows what the last one drew, reads input, and advances the clock.
 # Returns false when the window should close, so a game is `while aperture.frame() do ... end`.
+# It is also where a run with `flywheel --hot` switches to changed code (see hot.reload).
 function frame() returns bool
+    end_tick()
+    if debug_on do
+        draw_debug_panel()
+    end
     if collector_budget > 0 do
         gc.step(collector_budget)
     end
-    return nat.ap_frame()
+    count_down_frame()
+    var open = nat.ap_frame()
+    if debug_key > 0 and nat.ap_key_pressed(debug_key) do
+        debug_on = not debug_on
+    end
+    debug_lines = []
+    check_watched()
+    hot.reload()
+    return open
 end
 # Asks the game loop to end: the next frame() returns false.
 function quit()
     nat.ap_request_close()
 end
-# Seconds the last frame took, for movement that does not depend on the frame rate.
+# Seconds the last frame took, for movement that does not depend on the frame rate. Inside a
+# tick it is the tick's fixed step instead.
 function delta() returns double
+    if in_tick do
+        return tick_step
+    end
     return nat.ap_delta()
+end
+
+# --- Fixed steps -----------------------------------------------------------------------------
+
+# Game logic at a fixed rate, whatever the frame rate: `while ap.tick(60) do update() end`
+# runs update() exactly 60 times a second of play, as many times as the frame needs (none
+# when frames come faster than ticks, several when they come slower). Each run is one tick
+# (the "frame" of frame data): delta() is exactly 1/rate, key_pressed and the other "pressed"
+# and "released" checks compare with the previous tick, so a press lands on exactly one tick,
+# and hitstop and shake count down. Draw after the loop, using alpha() to blend between the
+# last two ticks if movement should look smooth. A frame runs at most 8 ticks; a longer
+# stall is dropped rather than caught up.
+function tick(int rate = 60) returns bool
+    end_tick()
+    if rate <= 0 do
+        throw ValueError("aperture.tick needs a positive rate")
+    end
+    var step = 1.0 / double(rate)
+    if tick_frame != nat.ap_frame_count() do
+        tick_frame = nat.ap_frame_count()
+        tick_accumulator += nat.ap_delta()
+        ticks_this_frame = 0
+    end
+    if ticks_this_frame >= 8 do
+        tick_accumulator = math.min(tick_accumulator, step)
+        return false
+    end
+    # A small tolerance keeps a 60 Hz display on one tick per frame despite clock jitter.
+    if tick_accumulator + step * 0.01 < step do
+        return false
+    end
+    tick_accumulator = math.max(tick_accumulator - step, 0.0)
+    tick_step = step
+    tick_number += 1
+    ticks_this_frame += 1
+    in_tick = true
+    nat.ap_tick_begin()
+    return true
+end
+# Ends the tick in progress, if any: input comparisons go back to whole frames.
+private function end_tick()
+    if not in_tick do
+        return
+    end
+    nat.ap_tick_end()
+    in_tick = false
+    if hitstop_left > 0 do
+        hitstop_left -= 1
+    end
+    if shake_left > 0 do
+        shake_left -= 1
+    end
+end
+# How far the clock is between the last tick and the next, 0 to 1: draw at
+# lerp(previous, current, alpha()) for smooth movement at any frame rate.
+function alpha() returns double
+    if tick_step <= 0 do
+        return 1
+    end
+    return math.clamp(tick_accumulator / tick_step, 0.0, 1.0)
+end
+# Ticks run since the window opened. Inside a tick, it is that tick's number (from 1).
+function tick_count() returns int
+    return tick_number
+end
+# The fixed step of the last tick in seconds (0 before any).
+function step() returns double
+    return tick_step
+end
+# Whether code is running inside a tick.
+function ticking() returns bool
+    return in_tick
+end
+
+# --- Hitstop and shake -----------------------------------------------------------------------
+
+# Freezes the action for `ticks` ticks, the pause on impact that makes a hit feel heavy: while
+# frozen() is true, skip movement and animation but keep reading input (so it buffers). A
+# longer hitstop replaces a shorter one; a shorter one leaves the longer in place.
+function hitstop(int ticks)
+    hitstop_left = math.max(hitstop_left, ticks)
+end
+# Whether hitstop is holding the current tick.
+function frozen() returns bool
+    return hitstop_left > 0
+end
+# Ticks of hitstop left.
+function hitstop_left_ticks() returns int
+    return hitstop_left
+end
+# Shakes the camera by up to `strength` pixels for `ticks` ticks, fading out (ticks count down
+# in tick(), or per frame in a game that does not use ticks). Cameras apply it themselves:
+# begin_camera and begin_3d move the view by shake_offset(). A stronger shake replaces a
+# weaker one.
+function shake(double strength, int ticks = 12)
+    var current = shake_strength * shake_fade()
+    if strength >= current do
+        shake_strength = strength
+        shake_length = math.max(ticks, 1)
+        shake_left = math.max(ticks, 1)
+    end
+end
+private function shake_fade() returns double
+    if shake_left <= 0 or shake_length <= 0 do
+        return 0
+    end
+    var t = double(shake_left) / double(shake_length)
+    return t * t
+end
+# The camera offset of the shake right now, in pixels (zero when not shaking). The pattern is
+# a function of the tick count, so a replay shakes the same way.
+function shake_offset() returns Vec2
+    if not shake_on or shake_left <= 0 do
+        return Vec2(0, 0)
+    end
+    var amount = shake_strength * shake_fade()
+    var t = double(tick_number + nat.ap_frame_count())
+    return Vec2(math.sin(t * 2.31) * math.cos(t * 0.77), math.cos(t * 1.93) * math.sin(t * 1.17)) * amount
+end
+# Turns shaking off (for players who ask for less motion) or back on.
+function shaking(bool on)
+    shake_on = on
+end
+private function count_down_frame()
+    if tick_frame < 0 and shake_left > 0 do
+        shake_left -= 1
+    end
 end
 # Seconds since the window opened.
 function time() returns double
@@ -244,6 +406,12 @@ function fps() returns double
 end
 function frame_count() returns int
     return nat.ap_frame_count()
+end
+# Makes every frame count as exactly `seconds` (0 goes back to the real time): for recording
+# video, deterministic tests, and replays that must match frame for frame. Unattended runs
+# (APERTURE_FRAMES) already count each frame as 1/target_fps, or 1/60.
+function fixed_delta(double seconds)
+    nat.ap_fixed_delta(seconds)
 end
 # Limits the frame rate (0 removes the limit; vsync still applies).
 function target_fps(int rate)
@@ -409,6 +577,727 @@ const int AXIS_RIGHT_X = 2
 const int AXIS_RIGHT_Y = 3
 const int AXIS_LEFT_TRIGGER = 4
 const int AXIS_RIGHT_TRIGGER = 5
+
+# --- Frame data ------------------------------------------------------------------------------
+
+# A box of a move's frame data, active on frames `from` to `to` (counting from 1): a hitbox,
+# hurtbox, pushbox, or any other kind. `area` is relative to the character's origin for a
+# character facing right; any other numbers given with it (damage, hitstun, ...) are in
+# `values`.
+class FrameBox
+    string kind
+    int from
+    int to
+    Rect area
+    map<string, double> values = {}
+
+    function active(int frame) returns bool
+        return frame >= this.from and frame <= this.to
+    end
+    # The box in the world for a character at `origin` facing `facing` (1 right, -1 left).
+    function placed(Vec2 origin, int facing = 1) returns Rect
+        var x = origin.x + this.area.x
+        if facing < 0 do
+            x = origin.x - this.area.x - this.area.w
+        end
+        return Rect(x, origin.y + this.area.y, this.area.w, this.area.h)
+    end
+    function value(string name, double fallback = 0) returns double
+        return this.values[name] if name in this.values else fallback
+    end
+end
+# A named range of frames: a cancel window (`into` names what it cancels into), or any other
+# window (invincible, armor, airborne, ...).
+class FrameWindow
+    string name
+    int from
+    int to
+    string[] into = []
+
+    function active(int frame) returns bool
+        return frame >= this.from and frame <= this.to
+    end
+end
+# One move's (or animation's) frame data. Frames count from 1, one per tick.
+class Move
+    string name
+    int frames = 0
+    bool loop = false
+    FrameBox[] boxes = []
+    FrameWindow[] windows = []
+    map<string, int[]> markers = {}
+    map<string, double> values = {}
+
+    # The boxes of a kind ("" for every kind) active on a frame.
+    function boxes_at(int frame, string kind = "") returns FrameBox[]
+        FrameBox[] out = []
+        for box in this.boxes do
+            if box.active(frame) and (kind == "" or box.kind == kind) do
+                out.push(box)
+            end
+        end
+        return out
+    end
+    function hitboxes(int frame) returns FrameBox[]
+        return this.boxes_at(frame, "hitbox")
+    end
+    function hurtboxes(int frame) returns FrameBox[]
+        return this.boxes_at(frame, "hurtbox")
+    end
+    # Whether a hitbox is out on this frame.
+    function active(int frame) returns bool
+        return this.hitboxes(frame).length > 0
+    end
+    # The first frame with a hitbox (0 when there is none).
+    function startup() returns int
+        var first = 0
+        for box in this.boxes do
+            if box.kind == "hitbox" and (first == 0 or box.from < first) do
+                first = box.from
+            end
+        end
+        return first
+    end
+    # Whether a named window is open on a frame.
+    function in_window(string name, int frame) returns bool
+        for w in this.windows do
+            if w.name == name and w.active(frame) do
+                return true
+            end
+        end
+        return false
+    end
+    # Whether the move can be cancelled into `into` (a move name or a group such as
+    # "special") on a frame.
+    function can_cancel(int frame, string into) returns bool
+        for w in this.windows do
+            if w.name == "cancel" and w.active(frame) and (w.into.length == 0 or w.into.contains(into)) do
+                return true
+            end
+        end
+        return false
+    end
+    # Whether a marker (a sound, a step, a spawn point) falls on this frame.
+    function at(string marker, int frame) returns bool
+        return marker in this.markers and this.markers[marker].contains(frame)
+    end
+    # The first frame of a marker, or 0.
+    function marker(string name) returns int
+        if name in this.markers and this.markers[name].length > 0 do
+            return this.markers[name][0]
+        end
+        return 0
+    end
+    # A number given with the move (damage, meter, ...).
+    function value(string name, double fallback = 0) returns double
+        return this.values[name] if name in this.values else fallback
+    end
+    # The frame after `frame`: wraps for a looping move, else stops at the last frame.
+    function next(int frame) returns int
+        if frame < this.frames do
+            return frame + 1
+        end
+        return 1 if this.loop else this.frames
+    end
+    # Whether the move is over after this frame.
+    function done(int frame) returns bool
+        return not this.loop and frame >= this.frames
+    end
+    # The animation time of a frame at `rate` ticks a second, for animate() and the like.
+    function seconds(int frame, int rate = 60) returns double
+        return double(math.max(frame - 1, 0)) / double(rate)
+    end
+    # Draws the boxes active on a frame when debug drawing is on (see debug): hitboxes red,
+    # hurtboxes blue, others green.
+    function draw_debug(int frame, Vec2 origin, int facing = 1)
+        if not debug_on do
+            return
+        end
+        for box in this.boxes_at(frame) do
+            var area = box.placed(origin, facing)
+            var color = GREEN
+            if box.kind == "hitbox" do
+                color = RED
+            else if box.kind == "hurtbox" do
+                color = SKY
+            end
+            fill(area, color.fade(0.25))
+            outline(area, 1, color)
+        end
+        text("{this.name} {frame}/{this.frames}", origin.x - 20, origin.y + 6, 8, YELLOW)
+    end
+end
+# Frame data for a set of moves, from a TOML or JSON file (see load_frames) or a model's
+# animations (Model.frame_data). The file is watched: when it changes, the moves are read
+# again in place (Move objects already handed out see the new numbers), so tuning a move
+# needs no restart. A file with a mistake keeps the last good data and prints the error.
+class FrameData
+    string path = ""
+    map<string, Move> moves = {}
+    int version = 0
+    string error = ""
+
+    function move(string name) returns Move
+        if not (name in this.moves) do
+            throw KeyError("no frame data for move '{name}'")
+        end
+        return this.moves[name]
+    end
+    function has(string name) returns bool
+        return name in this.moves
+    end
+    function names() returns string[]
+        return this.moves.keys()
+    end
+    # Reads the file again now (frame() also does this when it changes).
+    function reload() returns bool
+        try
+            var text = fs.read(this.path)
+            var document = toml.parse(text) if fs.extension(this.path) == ".toml" else json.parse(text)
+            this.merge(document)
+            this.error = ""
+            this.version += 1
+            return true
+        catch Error e
+            this.error = "{this.path}: {e.message}"
+            print("aperture: frame data not reloaded: {this.error}")
+            return false
+        end
+    end
+    # Takes moves from a document: one object per move name.
+    function merge(json.value document)
+        if json.kind(document) != "object" do
+            throw ValueError("frame data must be a table of moves")
+        end
+        map<string, Move> parsed = {}
+        for name in json.keys(document) do
+            parsed[name] = parse_move(name, document[name])
+        end
+        for name, fresh in parsed do
+            if name in this.moves do
+                var held = this.moves[name]
+                held.frames = fresh.frames
+                held.loop = fresh.loop
+                held.boxes = fresh.boxes
+                held.windows = fresh.windows
+                held.markers = fresh.markers
+                held.values = fresh.values
+            else do
+                this.moves[name] = fresh
+            end
+        end
+    end
+end
+# Loads frame data. In TOML, each move is a table:
+#
+#     [jab]
+#     frames = 18
+#     damage = 30                       # any number: Move.value("damage")
+#     hitbox = [{ from = 5, to = 7, box = [20, -60, 40, 20], hitstun = 12 }]
+#     hurtbox = [{ from = 1, to = 18, box = [-20, -90, 40, 90] }]
+#     cancel = [{ from = 6, to = 12, into = ["special"] }]
+#     invincible = [1, 3]               # a named window: from, to
+#     markers = { sound = 5, step = [3, 9] }
+#
+# Boxes are x, y, width, height from the character's origin, facing right (y down). Any list
+# of tables with a `box` is a box of that kind (pushbox, throwbox, ...); a two-number list is
+# a window; `frames` defaults to the last frame anything uses. The file is watched for
+# changes (see FrameData).
+function load_frames(string path) returns FrameData
+    var data = FrameData()
+    data.path = path
+    if not data.reload() do
+        throw ValueError(data.error)
+    end
+    watch_frames(data)
+    return data
+end
+private FrameData[] watched_frames = []
+private double[] watched_times = []
+private double watch_checked = 0
+private function watch_frames(FrameData data)
+    watched_frames.push(data)
+    watched_times.push(nat.ap_file_time(data.path))
+end
+# Reloads watched frame data files that changed (twice a second at most).
+private function check_watched()
+    if watched_frames.length == 0 or nat.ap_time() - watch_checked < 0.5 do
+        return
+    end
+    watch_checked = nat.ap_time()
+    for i, data in watched_frames do
+        var stamp = nat.ap_file_time(data.path)
+        if stamp >= 0 and stamp != watched_times[i] do
+            watched_times[i] = stamp
+            if data.reload() do
+                print("aperture: reloaded {data.path}")
+            end
+        end
+    end
+end
+private function parse_move(string name, json.value source) returns Move
+    var move = Move(name)
+    var last = 0
+    if json.kind(source) != "object" do
+        throw ValueError("move '{name}' must be a table")
+    end
+    for key in json.keys(source) do
+        var value = source[key]
+        var kind = json.kind(value)
+        if key == "frames" do
+            move.frames = json.as_int(value)
+        else if key == "loop" do
+            move.loop = json.as_bool(value)
+        else if key == "markers" do
+            for marker in json.keys(value) do
+                var at = value[marker]
+                int[] frames = []
+                if json.kind(at) == "array" do
+                    for f in json.items(at) do
+                        frames.push(json.as_int(f))
+                    end
+                else do
+                    frames.push(json.as_int(at))
+                end
+                for f in frames do
+                    last = math.max(last, f)
+                end
+                move.markers[marker] = frames
+            end
+        else if kind == "number" do
+            move.values[key] = json.as_double(value)
+        else if kind == "array" and json.length(value) == 2 and json.kind(value[0]) == "number" do
+            var w = FrameWindow(key, json.as_int(value[0]), json.as_int(value[1]))
+            last = math.max(last, w.to)
+            move.windows.push(w)
+        else if kind == "array" do
+            for item in json.items(value) do
+                if json.kind(item) != "object" or not json.has(item, "from") do
+                    throw ValueError("move '{name}': each '{key}' entry needs from and to")
+                end
+                var from = json.as_int(item["from"])
+                var to = json.as_int(item["to"]) if json.has(item, "to") else from
+                last = math.max(last, to)
+                if json.has(item, "box") do
+                    var b = item["box"]
+                    if json.length(b) != 4 do
+                        throw ValueError("move '{name}': a box is [x, y, width, height]")
+                    end
+                    var box = FrameBox(key, from, to, Rect(json.as_double(b[0]), json.as_double(b[1]),
+                        json.as_double(b[2]), json.as_double(b[3])))
+                    for field in json.keys(item) do
+                        if json.kind(item[field]) == "number" and field != "from" and field != "to" do
+                            box.values[field] = json.as_double(item[field])
+                        end
+                    end
+                    move.boxes.push(box)
+                else do
+                    var w = FrameWindow(key, from, to)
+                    if json.has(item, "into") do
+                        for target in json.items(item["into"]) do
+                            w.into.push(json.as_string(target))
+                        end
+                    end
+                    move.windows.push(w)
+                end
+            end
+        end
+    end
+    if move.frames == 0 do
+        move.frames = last
+    end
+    return move
+end
+
+# --- Debug drawing ---------------------------------------------------------------------------
+
+# Turns debug drawing on or off. While it is on, Move.draw_debug shows boxes, debug_text and
+# debug_inputs fill a panel drawn at the end of the frame, and debug_rect and friends draw.
+# F1 toggles it during play (see debug_toggle_key).
+function debug(bool on)
+    debug_on = on
+end
+function debugging() returns bool
+    return debug_on
+end
+# The key that toggles debug drawing (KEY_F1 by default; 0 for none).
+function debug_toggle_key(int key)
+    debug_key = key
+end
+# A line for the debug panel, this frame.
+function debug_text(string line)
+    if debug_on do
+        debug_lines.push(line)
+    end
+end
+# An input display in the debug panel, this frame.
+function debug_inputs(string label, Inputs inputs, int rows = 10)
+    if debug_on do
+        debug_lines.push(label)
+        for line in inputs.lines(rows) do
+            debug_lines.push("  " + line)
+        end
+    end
+end
+# A box outline, only while debugging (in whatever camera is active).
+function debug_rect(Rect area, Color color = GREEN)
+    if debug_on do
+        outline(area, 1, color)
+    end
+end
+function debug_point(Vec2 at, Color color = YELLOW)
+    if debug_on do
+        line(at.x - 4, at.y, at.x + 4, at.y, 1, color)
+        line(at.x, at.y - 4, at.x, at.y + 4, 1, color)
+    end
+end
+function debug_line_3d(Vec3 from, Vec3 to, Color color = YELLOW)
+    if debug_on do
+        line_3d(from, to, color)
+    end
+end
+private function draw_debug_panel()
+    var lines = ["{math.round(nat.ap_fps())} fps  frame {nat.ap_frame_count()}  tick {tick_number}"]
+    if hitstop_left > 0 do
+        lines.push("hitstop {hitstop_left}")
+    end
+    for l in debug_lines do
+        lines.push(l)
+    end
+    var widest = 0.0
+    for l in lines do
+        widest = math.max(widest, measure(l, 8).x)
+    end
+    rect(4, 4, widest + 8, double(lines.length) * 10.0 + 6, BLACK.fade(0.6))
+    for i, l in lines do
+        text(l, 8, 8 + double(i) * 10.0, 8, WHITE)
+    end
+end
+
+# --- Input history ---------------------------------------------------------------------------
+
+# One player's controls with a history of the last ticks, for fighting-game input: motions
+# like a quarter circle forward, charges, double taps, and a buffer for presses that come a
+# little early. Directions use numpad notation, seen from a player facing right: 6 forward,
+# 4 back, 2 down, 8 up, 3 down-forward, 5 neutral; face(-1) mirrors them for a player facing
+# left, so "236" is always toward the opponent.
+#
+#     var p1 = ap.Inputs()
+#     p1.directions(ap.KEY_W, ap.KEY_S, ap.KEY_A, ap.KEY_D)
+#     p1.button("punch", ap.KEY_J, ap.PAD_WEST)
+#     while ap.tick(60) do
+#         p1.update()
+#         if p1.motion("236") and p1.pressed("punch") do fireball() end
+#     end
+#
+# Call update() once per tick. Buttons are named; up to 16. For online play or replays, send
+# code() each tick and give the other side's codes to feed() instead of update().
+class Inputs
+    int length = 30
+    int pad = 0
+    int facing = 1
+    int[] keys_up = [82, 26]
+    int[] keys_down = [81, 22]
+    int[] keys_left = [80, 4]
+    int[] keys_right = [79, 7]
+    string[] names = []
+    int[][] button_keys = []
+    int[] button_pads = []
+    # The history, newest last: a direction (1-9, as on screen, before facing) and a button
+    # mask per tick.
+    int[] dirs = []
+    int[] masks = []
+    int[] consumed = []
+    int ticks = 0
+
+    constructor(int length = 30, int pad = 0)
+        this.length = math.max(length, 2)
+        this.pad = pad
+    end
+
+    # Keys for up, down, left, and right (replacing the arrows and WASD). The gamepad's d-pad
+    # and left stick always count too.
+    function directions(int up, int down, int left, int right)
+        this.keys_up = [up]
+        this.keys_down = [down]
+        this.keys_left = [left]
+        this.keys_right = [right]
+    end
+    # A button: a key, and a gamepad button (-1 for none). Binding a name again adds the key.
+    function button(string name, int key, int pad_button = -1)
+        var at = this.names.index_of(name)
+        if at < 0 do
+            if this.names.length >= 16 do
+                throw ValueError("aperture.Inputs holds at most 16 buttons")
+            end
+            this.names.push(name)
+            this.button_keys.push([key])
+            this.button_pads.push(pad_button)
+            this.consumed.push(-1)
+        else do
+            this.button_keys[at].push(key)
+            if pad_button >= 0 do
+                this.button_pads[at] = pad_button
+            end
+        end
+    end
+    # Which way the player faces: 1 right, -1 left. Directions and motions are read relative
+    # to it.
+    function face(int facing)
+        this.facing = -1 if facing < 0 else 1
+    end
+
+    # Reads the devices for this tick.
+    function update()
+        var x = 0
+        var y = 0
+        var stick = nat.ap_gamepad_connected(this.pad)
+        var sx = nat.ap_gamepad_axis(this.pad, 0) if stick else 0.0
+        var sy = nat.ap_gamepad_axis(this.pad, 1) if stick else 0.0
+        if this.any(this.keys_left) or nat.ap_gamepad_down(this.pad, PAD_LEFT) or sx < -0.5 do
+            x -= 1
+        end
+        if this.any(this.keys_right) or nat.ap_gamepad_down(this.pad, PAD_RIGHT) or sx > 0.5 do
+            x += 1
+        end
+        var up = this.any(this.keys_up) or nat.ap_gamepad_down(this.pad, PAD_UP) or sy < -0.5
+        var down = this.any(this.keys_down) or nat.ap_gamepad_down(this.pad, PAD_DOWN) or sy > 0.5
+        # Opposite directions together: left and right cancel, up wins over down.
+        if up do
+            y = 1
+        else if down do
+            y = -1
+        end
+        var mask = 0
+        var bit = 1
+        for i, name in this.names do
+            var held = this.any(this.button_keys[i])
+            if this.button_pads[i] >= 0 and nat.ap_gamepad_down(this.pad, this.button_pads[i]) do
+                held = true
+            end
+            if held do
+                mask += bit
+            end
+            bit *= 2
+        end
+        this.feed(5 + x + 3 * y, mask)
+    end
+    private function any(int[] keys) returns bool
+        for key in keys do
+            if nat.ap_key_down(key) do
+                return true
+            end
+        end
+        return false
+    end
+    # Records a tick of input that came from elsewhere: a direction 1-9 as on screen (6 is
+    # right, before facing) and a mask of the buttons held (1 for the first button bound, 2
+    # for the second, 4 for the third, ...).
+    function feed(int direction, int buttons)
+        this.dirs.push(math.clamp(direction, 1, 9))
+        this.masks.push(buttons)
+        if this.dirs.length > this.length do
+            this.dirs.remove_at(0)
+            this.masks.remove_at(0)
+        end
+        this.ticks += 1
+    end
+    # This tick as one number, direction + 10 * buttons, for sending and saving.
+    function code() returns int
+        if this.dirs.length == 0 do
+            return 5
+        end
+        return this.dirs[this.dirs.length - 1] + 10 * this.masks[this.masks.length - 1]
+    end
+    # Records a tick from code().
+    function feed_code(int code)
+        this.feed(code % 10, code // 10)
+    end
+    # Ticks recorded so far.
+    function count() returns int
+        return this.ticks
+    end
+    # Clears the history (a new round).
+    function clear()
+        this.dirs = []
+        this.masks = []
+        for i in 0..<this.consumed.length do
+            this.consumed[i] = -1
+        end
+    end
+
+    # The direction `ago` ticks back (0 is this tick), facing-relative.
+    function direction(int ago = 0) returns int
+        var at = this.dirs.length - 1 - ago
+        if at < 0 do
+            return 5
+        end
+        return this.relative(this.dirs[at])
+    end
+    private function relative(int raw) returns int
+        if this.facing > 0 do
+            return raw
+        end
+        var row = (raw - 1) // 3
+        var column = (raw - 1) % 3
+        return row * 3 + (2 - column) + 1
+    end
+    # Whether `direction` (facing-relative) is held this tick: "4" counts 1, 4, and 7; "2"
+    # counts 1, 2, and 3; a diagonal or 5 counts only itself.
+    function holding(string direction, int ago = 0) returns bool
+        return matches(this.direction(ago), direction)
+    end
+    private function slot(string name) returns int
+        var at = this.names.index_of(name)
+        if at < 0 do
+            throw KeyError("aperture.Inputs has no button '{name}'")
+        end
+        return at
+    end
+    private function mask_has(int mask, int at) returns bool
+        var bit = 1
+        for i in 0..<at do
+            bit *= 2
+        end
+        return (mask // bit) % 2 == 1
+    end
+    # Whether a button is held `ago` ticks back.
+    function held(string name, int ago = 0) returns bool
+        var at = this.masks.length - 1 - ago
+        return at >= 0 and this.mask_has(this.masks[at], this.slot(name))
+    end
+    # Whether a button went down this tick.
+    function pressed(string name) returns bool
+        return this.held(name, 0) and not this.held(name, 1)
+    end
+    # Whether a button came up this tick.
+    function released(string name) returns bool
+        return not this.held(name, 0) and this.held(name, 1)
+    end
+    # Whether a button went down in the last `window` ticks (this one included) and that press
+    # has not been consume()d: a press a few ticks early still counts when the move can start.
+    function buffered(string name, int window = 5) returns bool
+        var at = this.slot(name)
+        for ago in 0..<math.min(window, this.masks.length) do
+            var tick = this.ticks - ago
+            if tick <= this.consumed[at] do
+                return false
+            end
+            if this.held(name, ago) and not this.held(name, ago + 1) do
+                return true
+            end
+        end
+        return false
+    end
+    # Uses up a button's buffered press, so one press starts one move.
+    function consume(string name)
+        this.consumed[this.slot(name)] = this.ticks
+    end
+    # How many ticks in a row (up to this one) `direction` has been held.
+    function held_for(string direction) returns int
+        var n = 0
+        while n < this.dirs.length and this.holding(direction, n) do
+            n += 1
+        end
+        return n
+    end
+
+    # Whether a motion was made in the last `window` ticks: its directions in order, other
+    # directions allowed between them. "236" is a quarter circle forward, "214" back, "623" a
+    # dragon punch, "41236" a half circle forward, "2363214" and so on. Each step must be that
+    # exact direction.
+    function motion(string sequence, int window = 15) returns bool
+        var steps = sequence.chars()
+        if steps.length == 0 do
+            return false
+        end
+        var next = steps.length - 1
+        for ago in 0..<math.min(window, this.dirs.length) do
+            if string(this.direction(ago)) == string(steps[next]) do
+                next -= 1
+                if next < 0 do
+                    return true
+                end
+            end
+        end
+        return false
+    end
+    # Whether `direction` was held for at least `ticks` ticks and let go (or still held) no
+    # more than `grace` ticks ago: a charge move like "4" then 6 + punch is
+    # `charged("4", 45) and holding("6") and pressed("punch")`. The history must be at least
+    # ticks + grace long (Inputs(60) for the usual 45-tick charge).
+    function charged(string direction, int ticks = 45, int grace = 8) returns bool
+        for start in 0..<(grace + 1) do
+            var run = 0
+            while start + run < this.dirs.length and this.holding(direction, start + run) do
+                run += 1
+            end
+            if run >= ticks do
+                return true
+            end
+        end
+        return false
+    end
+    # Whether `direction` was just tapped a second time within `window` ticks: "6" for a
+    # forward dash, "4" for a back dash. True only on the tick of the second tap.
+    function double_tap(string direction, int window = 12) returns bool
+        if not this.holding(direction, 0) or this.holding(direction, 1) do
+            return false
+        end
+        var ago = 1
+        while ago < window and ago < this.dirs.length and not this.holding(direction, ago) do
+            ago += 1
+        end
+        return ago > 1 and ago < window and ago < this.dirs.length
+    end
+
+    # The history as text, newest first: one line per change of input, with how many ticks
+    # it lasted ("12 6 punch").
+    function lines(int count = 12) returns string[]
+        string[] out = []
+        var ago = 0
+        while ago < this.dirs.length and out.length < count do
+            var at = this.dirs.length - 1 - ago
+            var run = 1
+            while at - run >= 0 and this.dirs[at - run] == this.dirs[at] and this.masks[at - run] == this.masks[at] do
+                run += 1
+            end
+            var text = "{run} {this.relative(this.dirs[at])}"
+            for i, name in this.names do
+                if this.mask_has(this.masks[at], i) do
+                    text += " {name}"
+                end
+            end
+            out.push(text)
+            ago += run
+        end
+        return out
+    end
+    # Draws the input display (lines()) at x, y.
+    function draw(double x, double y, int rows = 12, double size = 16, Color color = WHITE)
+        var line_height = size * 1.25
+        for i, line in this.lines(rows) do
+            text(line, x, y + double(i) * line_height, size, color)
+        end
+    end
+end
+# Whether a numpad direction satisfies a wanted one: "4" accepts 1, 4, 7; "6" 3, 6, 9; "2" 1,
+# 2, 3; "8" 7, 8, 9; anything else only itself.
+private function matches(int direction, string wanted) returns bool
+    if wanted == "4" do
+        return direction == 1 or direction == 4 or direction == 7
+    end
+    if wanted == "6" do
+        return direction == 3 or direction == 6 or direction == 9
+    end
+    if wanted == "2" do
+        return direction == 1 or direction == 2 or direction == 3
+    end
+    if wanted == "8" do
+        return direction == 7 or direction == 8 or direction == 9
+    end
+    return string(direction) == wanted
+end
 
 # Whether a key is held. Keys name positions on the keyboard (KEY_W is the key where W is on
 # a US layout), which is what movement keys want.
@@ -637,7 +1526,8 @@ function camera_at(Vec2 target, double zoom = 1) returns Camera2D
 end
 # Draw through a camera until end_camera().
 function begin_camera(Camera2D camera)
-    nat.ap_camera(camera.target.x, camera.target.y, camera.offset.x, camera.offset.y,
+    var shaken = camera.offset + shake_offset()
+    nat.ap_camera(camera.target.x, camera.target.y, shaken.x, shaken.y,
         camera.rotation, camera.zoom)
 end
 function end_camera()
@@ -921,9 +1811,21 @@ end
 # Draw in 3D through a camera until end_3d(). Depth is tested, and 2D drawing (the HUD)
 # continues after end_3d().
 function begin_3d(Camera3D camera)
-    nat.ap_begin3d(camera.position.x, camera.position.y, camera.position.z, camera.target.x,
-        camera.target.y, camera.target.z, camera.up.x, camera.up.y, camera.up.z,
-        camera.fov, camera.near, camera.far)
+    var view = camera
+    var offset = shake_offset()
+    if offset.x != 0 or offset.y != 0 do
+        # Pixels of shake as world units at the target's distance.
+        var distance = (camera.target - camera.position).length()
+        var tall = 2 * distance * math.tan(camera.fov * math.PI / 360) if camera.fov > 0 else -camera.fov
+        var per_pixel = tall / math.max(height(), 1.0)
+        var up = camera.right().cross(camera.forward()).normalized()
+        var move = camera.right() * (offset.x * per_pixel) - up * (offset.y * per_pixel)
+        view = Camera3D(camera.position + move, camera.target + move, camera.up, camera.fov,
+            camera.near, camera.far)
+    end
+    nat.ap_begin3d(view.position.x, view.position.y, view.position.z, view.target.x,
+        view.target.y, view.target.z, view.up.x, view.up.y, view.up.z,
+        view.fov, view.near, view.far)
 end
 function end_3d()
     nat.ap_end3d()
@@ -1268,6 +2170,25 @@ class Model
             names.push(nat.ap_model_clip_name(this.id, i))
         end
         return names
+    end
+    # Frame data stored with the model: each animation whose glTF "extras" hold a table like
+    # one move of load_frames (in Blender, custom properties on the action, exported with
+    # Include > Custom Properties) becomes a move named after the animation.
+    function frame_data() returns FrameData
+        var data = FrameData()
+        data.path = "(model)"
+        var count = nat.ap_model_clip_count(this.id)
+        for clip in 0..<count do
+            var extras = nat.ap_model_clip_extras(this.id, clip)
+            if extras != "" do
+                var document = json.parse(extras)
+                if json.kind(document) == "object" do
+                    var name = nat.ap_model_clip_name(this.id, clip)
+                    data.moves[name] = parse_move(name, document)
+                end
+            end
+        end
+        return data
     end
     function has_animation(string name) returns bool
         return nat.ap_model_clip_find(this.id, name) >= 0
@@ -1626,8 +2547,43 @@ class Sound
     end
 end
 # Loads a WAV file.
+# Loads a WAV or Ogg Vorbis (.ogg) file into memory, for effects. Use play_music for long
+# tracks.
 function load_sound(string path) returns Sound
     return Sound(nat.ap_sound_load(path))
+end
+
+# Music: one track at a time, streamed from its .ogg or .wav file as it plays (an Ogg file is
+# decoded a little at a time, so a long track costs almost no memory). It keeps playing while
+# a frame takes long, because the audio device pulls it. Playing a track replaces the last.
+# Returns false when there is no audio device.
+function play_music(string path, double volume = 1, bool loop = true) returns bool
+    return nat.ap_music_play(path, volume, loop)
+end
+function stop_music()
+    nat.ap_music_stop()
+end
+function pause_music(bool paused = true)
+    nat.ap_music_pause(paused)
+end
+function music_volume(double volume)
+    nat.ap_music_volume(volume)
+end
+# Whether music is playing (false after a track that does not loop ends).
+function music_playing() returns bool
+    return nat.ap_music_playing()
+end
+# Seconds into the track, as heard.
+function music_position() returns double
+    return nat.ap_music_position()
+end
+# The track's length in seconds.
+function music_length() returns double
+    return nat.ap_music_length()
+end
+# Jumps to a point in the track.
+function seek_music(double seconds)
+    nat.ap_music_seek(seconds)
 end
 # A synthesized sound: a wave at `frequency` Hz for `seconds`, sliding to `slide_to` Hz (0
 # keeps the pitch) while fading out. Good for effects without sound files.

@@ -1,0 +1,246 @@
+# Duel: a training stage for a fighting game. You (left) against a dummy that throws a jab now
+# and then.
+#
+#     flywheel --hot examples/fighter.fw
+#
+#     A D       walk          S      crouch (no crouching moves yet)
+#     J         jab           K      strong
+#     2 3 6 + J burst (a quarter circle forward and jab)
+#     6 6       dash          F1     boxes, frame numbers, and the input display
+#     F5 / F9   save and load the state (training-mode reset)     R  reset the round
+#
+# Shows ap.tick (game logic at exactly 60 ticks a second), ap.Inputs (motions, double taps, and
+# buffered presses), frame data from examples/fighter.frames.toml (saved while the game runs,
+# it reloads in place), hitstop and camera shake on hits, debug drawing, deep_copy for saving
+# the whole state, and a random.Generator of its own so the dummy plays the same way in every
+# run. Run it with --hot and edit this file too: functions change on the next frame.
+import "../aperture.fw" as ap
+import fs
+import math
+import random
+
+const double FLOOR = 150
+const double WALK = 1.6
+const double DASH = 5.5
+
+class Fighter
+    string name
+    double x
+    int facing = 1
+    string move = "idle"
+    int frame = 1
+    bool hit_landed = false
+    int stun = 0
+    int health = 1000
+    ap.Color color = ap.SKY
+end
+# Everything that changes during play, so one deep_copy saves it all.
+class Match
+    Fighter[] fighters = []
+    random.Generator rng = random.Generator(2026)
+    int ticks = 0
+    int combo = 0
+    string message = ""
+end
+
+ap.open("Duel", 1280, 720, ap.RESIZABLE)
+ap.virtual_size(320, 180)
+var data = ap.load_frames(frames_file())
+var player = ap.Inputs(60)
+player.directions(ap.KEY_W, ap.KEY_S, ap.KEY_A, ap.KEY_D)
+player.button("jab", ap.KEY_J, ap.PAD_WEST)
+player.button("strong", ap.KEY_K, ap.PAD_NORTH)
+var game = new_match()
+Match? saved = null
+
+while ap.frame() do
+    if ap.key_pressed(ap.KEY_R) do
+        game = new_match()
+        player.clear()
+    end
+    if ap.key_pressed(ap.KEY_F5) do
+        saved = deep_copy(game)
+        game.message = "state saved"
+    end
+    if ap.key_pressed(ap.KEY_F9) do
+        if saved != null do
+            game = deep_copy(saved)
+            game.message = "state loaded"
+        end
+    end
+    while ap.tick(60) do
+        update(game)
+    end
+    draw(game)
+end
+ap.close()
+
+function frames_file() returns string
+    for place in ["examples/fighter.frames.toml", "fighter.frames.toml",
+            "aperture/examples/fighter.frames.toml"] do
+        if fs.exists(place) do
+            return place
+        end
+    end
+    return "fighter.frames.toml"
+end
+
+function new_match() returns Match
+    var m = Match()
+    m.fighters.push(Fighter("You", 110, 1))
+    var dummy = Fighter("Dummy", 210, -1)
+    dummy.color = ap.ORANGE
+    m.fighters.push(dummy)
+    return m
+end
+
+# One tick of the game.
+function update(Match m)
+    var you = m.fighters[0]
+    var dummy = m.fighters[1]
+    you.facing = 1 if dummy.x >= you.x else -1
+    dummy.facing = -you.facing
+    player.face(you.facing)
+    player.update()
+    m.ticks += 1
+    if ap.frozen() do
+        return # hitstop: input keeps buffering, nothing moves
+    end
+    control(you)
+    think(m, dummy)
+    for f in m.fighters do
+        advance(f)
+    end
+    resolve(m, you, dummy)
+    resolve(m, dummy, you)
+    you.x = math.clamp(you.x, 20.0, 300.0)
+    dummy.x = math.clamp(dummy.x, 20.0, 300.0)
+end
+
+function start(Fighter f, string move)
+    f.move = move
+    f.frame = 1
+    f.hit_landed = false
+end
+
+function free(Fighter f) returns bool
+    return f.stun == 0 and (f.move == "idle" or f.move == "walk")
+end
+
+function control(Fighter you)
+    var current = data.move(you.move)
+    var special = player.motion("236", 12) and player.buffered("jab", 4)
+    if special and (free(you) or (current.can_cancel(you.frame, "special") and you.hit_landed)) do
+        player.consume("jab")
+        start(you, "burst")
+        return
+    end
+    if not free(you) do
+        return
+    end
+    if player.double_tap("6") do
+        start(you, "dash")
+    else if player.buffered("strong", 3) do
+        player.consume("strong")
+        start(you, "strong")
+    else if player.buffered("jab", 3) do
+        player.consume("jab")
+        start(you, "jab")
+    else if player.holding("6") or player.holding("4") do
+        you.move = "walk"
+        you.x += WALK * (1.0 if player.holding("6") else -1.0) * double(you.facing)
+    else do
+        you.move = "idle"
+    end
+end
+
+# The dummy jabs at random when close, from its own generator: the same every run.
+function think(Match m, Fighter dummy)
+    if free(dummy) and math.abs(dummy.x - m.fighters[0].x) < 60 and m.rng.chance(0.006) do
+        start(dummy, "jab")
+    end
+end
+
+function advance(Fighter f)
+    if f.stun > 0 do
+        f.stun -= 1
+        f.move = "hurt" if f.stun > 0 else "idle"
+        return
+    end
+    var move = data.move(f.move)
+    if move.at("lunge", f.frame) do
+        f.x += 10.0 * double(f.facing)
+    end
+    if f.move == "dash" and f.frame >= move.marker("go") do
+        f.x += DASH * double(f.facing)
+    end
+    if move.at("flash", f.frame) do
+        ap.shake(3, 6)
+    end
+    if move.done(f.frame) do
+        start(f, "idle")
+    else do
+        f.frame = move.next(f.frame)
+    end
+end
+
+function resolve(Match m, Fighter attacker, Fighter defender)
+    if attacker.hit_landed do
+        return
+    end
+    var move = data.move(attacker.move)
+    var target = data.move(defender.move)
+    if target.in_window("invincible", defender.frame) do
+        return
+    end
+    for hit in move.hitboxes(attacker.frame) do
+        var box = hit.placed(ap.Vec2(attacker.x, FLOOR), attacker.facing)
+        for hurt in target.hurtboxes(defender.frame) do
+            if box.overlaps(hurt.placed(ap.Vec2(defender.x, FLOOR), defender.facing)) do
+                attacker.hit_landed = true
+                defender.health = math.max(defender.health - int(move.value("damage")), 0)
+                defender.stun = int(hit.value("hitstun", 10))
+                defender.x += 4.0 * double(attacker.facing)
+                ap.hitstop(int(hit.value("hitstop", 6)))
+                ap.shake(hit.value("shake", 2), 10)
+                m.combo = m.combo + 1 if defender.stun > 0 and m.combo > 0 else 1
+                return
+            end
+        end
+    end
+end
+
+function draw(Match m)
+    ap.clear(ap.Color(24, 22, 38, 255))
+    ap.begin_camera(ap.camera_at(ap.Vec2(160, 90)))
+    ap.rect(0, FLOOR, 320, 30, ap.Color(60, 52, 80, 255))
+    for f in m.fighters do
+        draw_fighter(f)
+        data.move(f.move).draw_debug(f.frame, ap.Vec2(f.x, FLOOR), f.facing)
+    end
+    ap.end_camera()
+    for i, f in m.fighters do
+        var x = 10.0 if i == 0 else 170.0
+        ap.rect(x, 8, 140, 6, ap.Color(60, 20, 30, 255))
+        ap.rect(x, 8, 140.0 * double(f.health) / 1000.0, 6, f.color)
+        ap.text(f.name, x, 17, 8, ap.WHITE)
+    end
+    if m.combo > 1 do
+        ap.text("{m.combo} hits", 10, 30, 8, ap.YELLOW)
+    end
+    if m.message != "" do
+        ap.text_centered(m.message, 160, 168, 8, ap.GRAY)
+    end
+    ap.debug_text("you: {m.fighters[0].move} {m.fighters[0].frame}  dummy: {m.fighters[1].move} {m.fighters[1].frame}")
+    ap.debug_inputs("input", player, 8)
+end
+
+function draw_fighter(Fighter f)
+    var tint = ap.WHITE if f.stun > 0 and f.stun % 4 < 2 else f.color
+    ap.rect(f.x - 12, FLOOR - 68, 24, 68, tint)
+    ap.rect(f.x - 6 + 6.0 * double(f.facing), FLOOR - 64, 6, 6, ap.BLACK)
+    var move = data.move(f.move)
+    for hit in move.hitboxes(f.frame) do
+        ap.fill(hit.placed(ap.Vec2(f.x, FLOOR), f.facing), tint)
+    end
+end

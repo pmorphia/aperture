@@ -97,7 +97,26 @@
      "input": 6,
      "output": 7
     }
-   ]
+   ],
+   "extras": {
+    "frames": 60,
+    "hitbox": [
+     {
+      "from": 20,
+      "to": 24,
+      "box": [
+       0,
+       -2,
+       1,
+       1
+      ],
+      "damage": 40
+     }
+    ],
+    "markers": {
+     "swish": 18
+    }
+   }
   },
   {
    "name": "Lift",
