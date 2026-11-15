@@ -2,10 +2,11 @@
 
 2D and 3D games in [Flywheel](https://github.com/pmorphia/flywheel): a window, input, shapes,
 sprites, text, cameras, meshes and glTF models with skeletal animation, physically based
-materials, shadows, instancing, render targets, shaders, and sound, drawn with OpenGL through
-SDL3.
+materials, shadows, instancing, render targets, shaders, sound and streamed music, and what
+fighting games and other frame-exact games need: fixed-step ticks, input history with motion
+inputs, frame data, hitstop, camera shake, and debug drawing. Drawn with OpenGL through SDL3.
 
-Aperture is currently in its **beta** phase: version **2.3 (beta-3)**.
+Aperture is currently in its **beta** phase: version **2.4 (beta-4)**.
 
 ```flywheel
 import aperture as ap
@@ -28,8 +29,8 @@ flywheel game.fw                # or: flywheel --build game.fw -O3 -o game
 
 ## Requirements
 
-- Flywheel 2.21 (beta-21) or newer: Aperture uses structs, native handles, `// flywheel:`
-  build directives, and the built-in `vecmath` module.
+- Flywheel 2.26 (beta-26) or newer: Aperture uses structs, native handles, `// flywheel:`
+  build directives, the built-in `vecmath` module, and the `hot` module.
 - SDL 3.2 or newer with its development files, found through `pkg-config sdl3` (Arch:
   `sdl3`; Debian/Ubuntu: `libsdl3-dev`; Fedora: `SDL3-devel`). Images (PNG, JPEG, BMP, TGA)
   load with any of them; PNG screenshots need SDL 3.4 (older versions save BMP).
@@ -59,6 +60,42 @@ calls of it.
 
 Multiply speeds by `delta()` so the game runs the same at any frame rate.
 
+Run a game with `flywheel --hot game.fw` and edit its code while it plays: `frame()` switches
+to the new functions within a frame of the recompile, keeping the game's state (see
+[hot reload](https://github.com/pmorphia/flywheel/blob/main/docs/tooling.md#hot-reload)).
+
+### Fixed steps
+
+Fighting games, rhythm games, and anything with replays or netcode count time in ticks, not
+seconds. `tick(rate)` runs game logic at exactly `rate` ticks a second whatever the frame
+rate: a frame runs it as many times as the time that passed needs (none when frames come
+faster, several when they come slower):
+
+```flywheel
+while ap.frame() do
+    while ap.tick(60) do
+        update()            # exactly 1/60 s of game time, every time
+    end
+    draw(ap.alpha())        # 0..1 between the last tick and the next, for smooth drawing
+end
+```
+
+Inside a tick, `delta()` is exactly the step, and `key_pressed`, `pad_pressed`,
+`mouse_pressed`, and their `released` twins compare with the previous tick, so a press lands
+on exactly one tick. `tick_count()`, `step()`, and `ticking()` tell where you are. A frame runs
+at most 8 ticks; a longer stall is dropped instead of caught up. `fixed_delta(seconds)` makes
+every frame count as exactly that long, for recording video and deterministic tests.
+
+### Hitstop and shake
+
+| | |
+|---|---|
+| `hitstop(ticks)`, `frozen()` | freeze the action on impact: while `frozen()`, skip movement and animation but keep reading input, so it buffers |
+| `shake(strength, ticks = 12)` | shake the camera by up to `strength` pixels, fading out; `begin_camera` and `begin_3d` apply it themselves |
+| `shake_offset()`, `shaking(on)` | the current offset, for drawing without a camera; turn shaking off (for players who want less motion) |
+
+Both count down in ticks (per frame in a game that does not use ticks). The shake pattern
+depends only on the tick count, so replays shake the same way.
 ## Values
 
 `Vec2`, `Vec3`, `Color`, `Rect`, `Camera2D`, `Camera3D`, and `Ray` are structs: they are
@@ -95,6 +132,47 @@ Whole numbers can be written without `.0` wherever a number is expected: `ap.rec
 | `steer()` | the direction from arrow keys, WASD, the d-pad, or the left stick, at most 1 long |
 | `send_key(key, down)`, `send_mouse(position, button, down)` | synthetic input for tests and replays |
 
+### Input history
+
+`Inputs` is one player's controls with a history of the last ticks (30 by default), for
+fighting-game input. Directions use numpad notation as seen by a player facing right (6
+forward, 4 back, 2 down, 3 down-forward, 5 neutral); `face(-1)` mirrors them for a player
+facing left, so `"236"` is always toward the opponent.
+
+```flywheel
+var p1 = ap.Inputs(60)                                  # 60 ticks of history
+p1.directions(ap.KEY_W, ap.KEY_S, ap.KEY_A, ap.KEY_D)   # the d-pad and left stick count too
+p1.button("punch", ap.KEY_J, ap.PAD_WEST)
+p1.button("kick", ap.KEY_K, ap.PAD_SOUTH)
+while ap.frame() do
+    while ap.tick(60) do
+        p1.face(1 if me.x < them.x else -1)
+        p1.update()
+        if p1.motion("236") and p1.buffered("punch") do
+            p1.consume("punch")
+            fireball()
+        else if p1.double_tap("6") do
+            dash()
+        end
+    end
+end
+```
+
+| | |
+|---|---|
+| `update()` | read the devices for this tick (once per tick) |
+| `direction(ago = 0)`, `holding("4")` | numpad direction; whether one is held ("4" counts 1, 4, 7) |
+| `held(name)`, `pressed(name)`, `released(name)` | a button this tick |
+| `buffered(name, window = 5)`, `consume(name)` | a press within the last ticks that has not been used, so a press slightly early still counts; use it up |
+| `motion("236", window = 15)` | a motion, in order, with other directions allowed between: `"236"`, `"214"`, `"623"`, `"41236"`, ... |
+| `charged("4", ticks = 45, grace = 8)` | held back (or down) long enough, released no more than `grace` ticks ago |
+| `double_tap("6", window = 12)` | the second tap of a dash, on its tick |
+| `held_for("2")` | ticks in a row a direction has been held |
+| `code()`, `feed(direction, buttons)`, `feed_code(code)` | one tick as a number, for netcode and replays: send `code()`, and `feed_code` the other side's instead of `update()` |
+| `lines(count)`, `draw(x, y)` | the history as text, newest first, and an input display |
+| `face(facing)`, `clear()` | which way the player faces; forget the history (a new round) |
+
+Left and right together cancel; up wins over down. Up to 16 buttons.
 ## Drawing in 2D
 
 Positions are in pixels from the top left; angles are degrees, clockwise.
@@ -134,7 +212,7 @@ stops at walls, and `draw(sheet, cell_size)`.
 ### Text
 
 `text(content, x, y, size = 16, color = WHITE, font = null)` draws with the built-in 5x7
-pixel font, which needs no file. `text_centered` and `measure` do what they say.
+pixel font (with descenders on g j p q y), which needs no file. `text_centered` and `measure` do what they say.
 `import aperture.ttf` adds `ttf.load_font("font.ttf", 48)` for TrueType and OpenType fonts,
 and `Font.from_grid(texture, cell_w, cell_h)` makes a font from a sheet of characters. Fonts
 cover ASCII and Latin-1.
@@ -295,7 +373,78 @@ ap.stop(music)
 `tone(wave, frequency, seconds, slide_to, volume)` synthesizes effects (`WAVE_SINE`,
 `WAVE_SQUARE`, `WAVE_SAW`, `WAVE_TRIANGLE`, `WAVE_NOISE`). Up to 32 sounds play at once;
 `set_volume`, `set_pitch`, `pause`, `playing`, `stop_all`, and `master_volume` control them.
-Sound files are WAV.
+Sound files are WAV or Ogg Vorbis (`.ogg`).
+
+Music streams from its file instead of loading whole: an Ogg track is decoded a little at a
+time on the audio thread, so a long track costs almost no memory and keeps playing while a
+frame takes long.
+
+```flywheel
+ap.play_music("theme.ogg", 0.6)            # volume; loops unless you pass false
+ap.music_volume(0.3)
+ap.pause_music()
+ap.pause_music(false)
+print ap.music_position(), ap.music_length()
+ap.seek_music(30)
+ap.stop_music()
+```
+
+One track plays at a time; `play_music` replaces it. `music_playing()` turns false after a
+track that does not loop ends.
+
+## Frame data
+
+Hitboxes, hurtboxes, cancel windows, and other per-frame facts of a move live in a TOML (or
+JSON) file next to the game, or in a glTF model's animations. Frames count from 1, one per
+tick.
+
+```toml
+[jab]
+frames = 18
+damage = 30                                    # any number: move.value("damage")
+hitbox = [{ from = 5, to = 7, box = [20, -60, 40, 20], hitstun = 12, hitstop = 6 }]
+hurtbox = [{ from = 1, to = 18, box = [-20, -90, 40, 90] }]
+cancel = [{ from = 6, to = 12, into = ["special"] }]
+invincible = [1, 3]                            # a named window: first and last frame
+markers = { sound = 5, step = [3, 9] }
+```
+
+```flywheel
+var data = ap.load_frames("fighter.frames.toml")
+var jab = data.move("jab")
+if jab.active(frame) do ... end                          # a hitbox is out
+for hit in jab.hitboxes(frame) do
+    if hit.placed(me.position, me.facing).overlaps(target) do
+        ap.hitstop(int(hit.value("hitstop", 6)))
+    end
+end
+jab.can_cancel(frame, "special"); jab.in_window("invincible", frame); jab.at("sound", frame)
+jab.draw_debug(frame, me.position, me.facing)            # boxes, when debug drawing is on
+```
+
+Boxes are x, y, width, height from the character's origin for a character facing right;
+`placed(origin, facing)` puts one in the world, mirrored for facing left. Any list of tables
+with a `box` is a box of that kind (`pushbox`, `throwbox`, ...), and the numbers given with a
+box are its `value`s. A `Move` also has `boxes_at(frame, kind)`, `startup()`, `marker(name)`,
+`next(frame)` and `done(frame)` (for looping and one-shot moves), and `seconds(frame)` for
+syncing an animation.
+
+The file is watched while the game runs: save it and the moves change on the next frame, in
+place (a `Move` you hold sees the new numbers). A file with a mistake prints the error and
+keeps the last good data.
+
+`model.frame_data()` reads the same tables from a glTF model's animation `extras` (in Blender:
+custom properties on the action, exported with Include > Custom Properties), one move per
+animation, named after it.
+
+## Debug drawing
+
+`debug(on)` turns debug drawing on, and F1 toggles it during play (`debug_toggle_key` changes
+the key). While it is on, `Move.draw_debug` shows boxes (hitboxes red, hurtboxes blue, others
+green) with the move's frame number, `debug_rect`, `debug_point`, and `debug_line_3d` draw,
+and a panel in the corner shows the frame rate, frame and tick numbers, hitstop, every
+`debug_text(line)` of the frame, and input displays from `debug_inputs(label, inputs)`. When
+it is off, all of these do nothing.
 
 ## Helpers
 
@@ -314,13 +463,16 @@ flywheel examples/shooter.fw      # a top-down shooter: waves, aiming, many bull
 flywheel examples/gallery.fw      # a lit 3D scene with picking
 flywheel examples/showroom.fw     # shadows, materials, a forest of instances; add -- model.glb
 flywheel examples/skyhop.fw       # a 3D platformer: islands, moving platforms, crystals to find
+flywheel --hot examples/fighter.fw   # a fighting-game training stage: ticks, motions, frame data
 ```
 
 `flywheel --new --game NAME` (or `pulley new NAME --game`) starts a project with Aperture as a
 dependency and a small playable game.
 
 To run a game unattended (tests, CI, thumbnails), `APERTURE_FRAMES=n` ends it after n frames
-and `APERTURE_SCREENSHOT=path` saves the last one:
+and `APERTURE_SCREENSHOT=path` saves the last one. Every frame of such a run counts as exactly
+1/`target_fps` (or 1/60) seconds, however fast it really draws, so the run is the same every
+time:
 
 ```sh
 SDL_VIDEODRIVER=offscreen APERTURE_FRAMES=120 APERTURE_SCREENSHOT=shot.png flywheel game.fw
@@ -334,13 +486,15 @@ SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy flywheel --test tests/    # with
 ```
 
 The tests open a hidden window, draw, and read the pixels back. `tests/models/` holds small
-glTF, GLB, and OBJ files written by `tools/test_models.py`.
+glTF, GLB, and OBJ files written by `tools/test_models.py`, and `tests/audio/beep.ogg` is half
+a second of a 440 Hz tone.
 
 ## Notes
 
 - One window at a time; drawing calls belong to the thread that opened it.
-- A file in your project named like a module Aperture imports (`math.fw`, `gc.fw`) takes
-  its place, as for any Flywheel import; rename the file.
+- A file in your project named like a module Aperture imports (`math.fw`, `gc.fw`, `fs.fw`,
+  `json.fw`, `toml.fw`, `hot.fw`) takes its place, as for any Flywheel import; rename the file.
 - `native/backend.c` is the renderer; `native/model.h` reads glTF and OBJ models;
-  `native/stb_image.h` (v2.32, public domain) decodes images; `native/font5x7.h` is generated
+  `native/stb_image.h` (v2.32, public domain) decodes images; `native/stb_vorbis.h`
+  (stb_vorbis v1.24, public domain) decodes Ogg Vorbis; `native/font5x7.h` is generated
   by `tools/font.py`.
