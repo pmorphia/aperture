@@ -100,6 +100,7 @@ void fw_foreign_fail(const char *message);
     F(void, DrawArrays, (GLenum, GLint, GLsizei))                                                  \
     F(void, DrawBuffer, (GLenum))                                                                  \
     F(void, DrawElements, (GLenum, GLsizei, GLenum, const void *))                                 \
+    F(void, GetBufferSubData, (GLenum, ptrdiff_t, ptrdiff_t, void *))                              \
     F(void, DrawElementsInstanced, (GLenum, GLsizei, GLenum, const void *, GLsizei))               \
     F(void, Enable, (GLenum))                                                                      \
     F(void, EnableVertexAttribArray, (GLuint))                                                     \
@@ -210,11 +211,23 @@ typedef struct {
     SDL_AudioSpec spec;
     Uint8 *data;
     Uint32 length;
+    float *mono;        /* the sound as 32-bit float mono, made the first time it plays in space */
+    Uint32 mono_frames;
 } Sound;
+/* A voice plays one sound. Voices in space (ap_sound_play_at) are fed by spatial_feed on the
+   audio thread from the sound's mono samples, panned and muffled for where they are relative
+   to the listener; the main thread sets their targets in audio_update. */
 typedef struct {
     SDL_AudioStream *stream;
     int sound;
     bool looping;
+    bool spatial, finished;
+    float position[3];
+    float near, far;
+    float left, right, cutoff;            /* targets: ear gains and low-pass amount, 0 to 1 */
+    float heard_left, heard_right, heard_cutoff; /* where the audio thread is */
+    float filter;                         /* low-pass state */
+    Uint32 at;                            /* next frame of the sound */
 } Voice;
 
 /* Uniforms of the 3D programs, looked up by name once per program. */
@@ -326,6 +339,7 @@ static struct {
     Shader shaders[AP_MAX_SHADERS];
     Sound sounds[AP_MAX_SOUNDS];
     Voice voices[AP_MAX_VOICES];
+    float listener[3], listener_forward[3], listener_right[3];
     int canvas; /* the render target being drawn to, or 0 */
     SDL_AudioDeviceID audio;
     float master_volume;
@@ -988,6 +1002,8 @@ void ap_open(const char *title, long width, long height, long flags) {
     A.open = true;
     session_count++;
     A.master_volume = 1;
+    A.listener_forward[2] = -1;
+    A.listener_right[0] = 1;
     SDL_GL_SetSwapInterval(flags & 4 ? 0 : 1);
     refresh_size();
 
@@ -3691,6 +3707,945 @@ void ap_model_draw_many(long id, long material, const void *matrices, long count
     draw_model(model, identity, material, color, (int)count);
 }
 
+/* --- Collision worlds ---------------------------------------------------------------------- */
+/* Static triangles (boxes, meshes, models, or loose
+   triangles) in a bounding volume hierarchy, with ray casts, sphere tests and sweeps, and
+   capsule movement that slides along walls, stands on slopes, climbs steps, and keeps to the
+   ground going down. Worlds do not need a window except to add meshes and
+   models (whose triangles are read back from the graphics card), so a game server can use
+   them with boxes and triangles alone. Everything is double precision. */
+
+#define AP_MAX_WORLDS 64
+
+typedef struct {
+    double a[3], b[3], c[3], n[3];
+    int group;
+} Tri;
+typedef struct {
+    double low[3], high[3];
+    int left, right; /* children; a leaf has left = -1 and its triangles in order[first..] */
+    int first, count;
+} BvhNode;
+typedef struct {
+    bool used, dirty;
+    Tri *tris;
+    int count, capacity;
+    bool *off; /* by group */
+    int groups, group_capacity;
+    BvhNode *nodes;
+    int node_count, node_capacity;
+    int *order;
+} World;
+static World worlds[AP_MAX_WORLDS];
+static double world_results[16];
+static int *world_found;
+static int world_found_count, world_found_capacity;
+
+/* --- Vectors ------------------------------------------------------------------------------- */
+static void d3_sub(double *o, const double *a, const double *b) {
+    o[0] = a[0] - b[0], o[1] = a[1] - b[1], o[2] = a[2] - b[2];
+}
+static void d3_add_scaled(double *o, const double *a, const double *b, double s) {
+    o[0] = a[0] + b[0] * s, o[1] = a[1] + b[1] * s, o[2] = a[2] + b[2] * s;
+}
+static double d3_dot(const double *a, const double *b) {
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+static void d3_cross(double *o, const double *a, const double *b) {
+    double r[3] = {a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]};
+    memcpy(o, r, sizeof r);
+}
+static double d3_length(const double *a) {
+    return sqrt(d3_dot(a, a));
+}
+static void d3_copy(double *o, const double *a) {
+    memcpy(o, a, 3 * sizeof(double));
+}
+static double clamp01(double x) {
+    return x < 0 ? 0 : x > 1 ? 1 : x;
+}
+
+/* --- Building ------------------------------------------------------------------------------ */
+static World *world_of(long id) {
+    if (id > 0 && id < AP_MAX_WORLDS && worlds[id].used)
+        return &worlds[id];
+    fail("using a collision world that does not exist (or was freed)");
+    return NULL;
+}
+long ap_world_new(void) {
+    for (int i = 1; i < AP_MAX_WORLDS; i++)
+        if (!worlds[i].used) {
+            memset(&worlds[i], 0, sizeof worlds[i]);
+            worlds[i].used = true;
+            worlds[i].groups = 1; /* group 0 is never handed out */
+            return i;
+        }
+    fail("too many collision worlds (%d)", AP_MAX_WORLDS - 1);
+    return 0;
+}
+void ap_world_free(long id) {
+    if (id <= 0 || id >= AP_MAX_WORLDS || !worlds[id].used)
+        return;
+    World *w = &worlds[id];
+    free(w->tris);
+    free(w->off);
+    free(w->nodes);
+    free(w->order);
+    memset(w, 0, sizeof *w);
+}
+/* A new group: the triangles added with it can be removed or switched off together. */
+long ap_world_group(long id) {
+    World *w = world_of(id);
+    if (!w)
+        return 0;
+    if (w->groups >= w->group_capacity) {
+        w->group_capacity = w->group_capacity ? w->group_capacity * 2 : 64;
+        w->off = realloc(w->off, (size_t)w->group_capacity * sizeof(bool));
+    }
+    w->off[w->groups] = false;
+    return w->groups++;
+}
+static bool group_ok(World *w, long group) {
+    if (group > 0 && group < w->groups)
+        return true;
+    fail("collision group %ld is not one of this world's", group);
+    return false;
+}
+/* Adds a triangle (degenerate ones are skipped). */
+static void world_add(World *w, int group, const double *a, const double *b, const double *c) {
+    double e1[3], e2[3], n[3];
+    d3_sub(e1, b, a);
+    d3_sub(e2, c, a);
+    d3_cross(n, e1, e2);
+    double length = d3_length(n);
+    if (length < 1e-12)
+        return;
+    if (w->count == w->capacity) {
+        w->capacity = w->capacity ? w->capacity * 2 : 256;
+        w->tris = realloc(w->tris, (size_t)w->capacity * sizeof(Tri));
+    }
+    Tri *t = &w->tris[w->count++];
+    d3_copy(t->a, a);
+    d3_copy(t->b, b);
+    d3_copy(t->c, c);
+    for (int i = 0; i < 3; i++)
+        t->n[i] = n[i] / length;
+    t->group = group;
+    w->dirty = true;
+}
+static void transform_point(double *out, const float *m, const double *p) {
+    double r[3];
+    for (int row = 0; row < 3; row++)
+        r[row] = m[row] * p[0] + m[4 + row] * p[1] + m[8 + row] * p[2] + m[12 + row];
+    d3_copy(out, r);
+}
+/* A box: the unit cube centered on the origin, placed like a drawn mesh. */
+void ap_world_box(long id, long group, double x, double y, double z, double rx, double ry,
+                  double rz, double sx, double sy, double sz) {
+    World *w = world_of(id);
+    if (!w || !group_ok(w, group))
+        return;
+    float m[16];
+    m4_identity(m);
+    placement(m, x, y, z, rx, ry, rz, sx, sy, sz);
+    double corner[8][3];
+    for (int i = 0; i < 8; i++) {
+        double p[3] = {i & 1 ? 0.5 : -0.5, i & 2 ? 0.5 : -0.5, i & 4 ? 0.5 : -0.5};
+        transform_point(corner[i], m, p);
+    }
+    /* Each face as two triangles, wound outward. */
+    static const int faces[6][4] = {{0, 2, 3, 1}, {4, 5, 7, 6}, {0, 1, 5, 4},
+                                    {2, 6, 7, 3}, {0, 4, 6, 2}, {1, 3, 7, 5}};
+    for (int f = 0; f < 6; f++) {
+        const int *q = faces[f];
+        world_add(w, (int)group, corner[q[0]], corner[q[1]], corner[q[2]]);
+        world_add(w, (int)group, corner[q[0]], corner[q[2]], corner[q[3]]);
+    }
+}
+/* Loose triangles: `count` points (doubles, three per point), three per triangle. */
+void ap_world_triangles(long id, long group, const void *points, long count) {
+    World *w = world_of(id);
+    if (!w || !group_ok(w, group) || !points)
+        return;
+    const double *p = (const double *)points;
+    for (long i = 0; i + 2 < count; i += 3)
+        world_add(w, (int)group, p + i * 3, p + i * 3 + 3, p + i * 3 + 6);
+}
+/* The triangles of a mesh on the graphics card, placed by `m`. */
+static void world_add_mesh(World *w, int group, const Mesh *mesh, const float *m) {
+    if (!mesh || mesh->index_count < 3)
+        return;
+    Vertex3 *vertices = malloc((size_t)mesh->vertex_count * sizeof(Vertex3));
+    unsigned *indices = malloc((size_t)mesh->index_count * sizeof(unsigned));
+    glBindBuffer_(0x8F36 /* GL_COPY_READ_BUFFER */, mesh->vbo);
+    glGetBufferSubData_(0x8F36, 0, (ptrdiff_t)mesh->vertex_count * (ptrdiff_t)sizeof(Vertex3),
+                        vertices);
+    glBindBuffer_(0x8F36, mesh->ebo);
+    glGetBufferSubData_(0x8F36, 0, (ptrdiff_t)mesh->index_count * (ptrdiff_t)sizeof(unsigned),
+                        indices);
+    glBindBuffer_(0x8F36, 0);
+    for (int i = 0; i + 2 < mesh->index_count; i += 3) {
+        double p[3][3];
+        for (int k = 0; k < 3; k++) {
+            unsigned index = indices[i + k];
+            if (index >= (unsigned)mesh->vertex_count)
+                goto next;
+            const Vertex3 *v = &vertices[index];
+            double local[3] = {v->x, v->y, v->z};
+            transform_point(p[k], m, local);
+        }
+        world_add(w, group, p[0], p[1], p[2]);
+    next:;
+    }
+    free(vertices);
+    free(indices);
+}
+void ap_world_mesh(long id, long group, long mesh, double x, double y, double z, double rx,
+                   double ry, double rz, double sx, double sy, double sz) {
+    World *w = world_of(id);
+    if (!w || !group_ok(w, group) || !ready())
+        return;
+    Mesh *gpu = mesh_of(mesh);
+    if (!gpu) {
+        fail("adding a mesh that does not exist (or was freed) to a collision world");
+        return;
+    }
+    float m[16];
+    m4_identity(m);
+    placement(m, x, y, z, rx, ry, rz, sx, sy, sz);
+    world_add_mesh(w, (int)group, gpu, m);
+}
+/* A model's triangles in its current pose (skinned meshes in their bind pose). */
+void ap_world_model(long id, long group, long model_id, double x, double y, double z, double rx,
+                    double ry, double rz, double sx, double sy, double sz) {
+    World *w = world_of(id);
+    if (!w || !group_ok(w, group) || !ready())
+        return;
+    Model *model = model_or_fail(model_id);
+    if (!model)
+        return;
+    model_pose(model);
+    float base[16];
+    m4_identity(base);
+    placement(base, x, y, z, rx, ry, rz, sx, sy, sz);
+    for (int k = 0; k < model->node_count; k++) {
+        Node *n = &model->nodes[k];
+        if (n->mesh < 0)
+            continue;
+        ModelMesh *mesh = &model->meshes[n->mesh];
+        bool skinned = n->skin >= 0 && model->skins[n->skin].count > 0;
+        float m[16];
+        if (skinned)
+            memcpy(m, base, sizeof m);
+        else
+            m4_multiply(m, base, n->world);
+        for (int p = mesh->first; p < mesh->first + mesh->count; p++)
+            world_add_mesh(w, (int)group, mesh_of(model->primitives[p].mesh), m);
+    }
+}
+/* Takes a group's triangles out of the world (the group can be added to again). */
+void ap_world_remove(long id, long group) {
+    World *w = world_of(id);
+    if (!w || !group_ok(w, group))
+        return;
+    int kept = 0;
+    for (int i = 0; i < w->count; i++)
+        if (w->tris[i].group != group)
+            w->tris[kept++] = w->tris[i];
+    w->count = kept;
+    w->dirty = true;
+}
+/* Switches a group off (a door that opened) or back on, without rebuilding anything. */
+void ap_world_enable(long id, long group, bool on) {
+    World *w = world_of(id);
+    if (w && group_ok(w, group))
+        w->off[group] = !on;
+}
+void ap_world_clear(long id) {
+    World *w = world_of(id);
+    if (!w)
+        return;
+    w->count = 0;
+    w->dirty = true;
+}
+long ap_world_count(long id) {
+    World *w = world_of(id);
+    return w ? w->count : 0;
+}
+
+/* --- The hierarchy --------------------------------------------------------------------------- */
+static void tri_bounds(const Tri *t, double *low, double *high) {
+    for (int c = 0; c < 3; c++) {
+        low[c] = fmin(t->a[c], fmin(t->b[c], t->c[c]));
+        high[c] = fmax(t->a[c], fmax(t->b[c], t->c[c]));
+    }
+}
+static double tri_center(const Tri *t, int axis) {
+    return (t->a[axis] + t->b[axis] + t->c[axis]) / 3;
+}
+static int bvh_node(World *w) {
+    if (w->node_count == w->node_capacity) {
+        w->node_capacity = w->node_capacity ? w->node_capacity * 2 : 256;
+        w->nodes = realloc(w->nodes, (size_t)w->node_capacity * sizeof(BvhNode));
+    }
+    return w->node_count++;
+}
+static World *sorting_world;
+static int sorting_axis;
+static int by_center(const void *x, const void *y) {
+    double a = tri_center(&sorting_world->tris[*(const int *)x], sorting_axis);
+    double b = tri_center(&sorting_world->tris[*(const int *)y], sorting_axis);
+    return a < b ? -1 : a > b;
+}
+static int bvh_build(World *w, int first, int count) {
+    int index = bvh_node(w);
+    BvhNode node = {{INFINITY, INFINITY, INFINITY}, {-INFINITY, -INFINITY, -INFINITY}, -1, -1,
+                    first, count};
+    double center_low[3] = {INFINITY, INFINITY, INFINITY},
+           center_high[3] = {-INFINITY, -INFINITY, -INFINITY};
+    for (int i = first; i < first + count; i++) {
+        const Tri *t = &w->tris[w->order[i]];
+        double low[3], high[3];
+        tri_bounds(t, low, high);
+        for (int c = 0; c < 3; c++) {
+            node.low[c] = fmin(node.low[c], low[c]);
+            node.high[c] = fmax(node.high[c], high[c]);
+            double m = tri_center(t, c);
+            center_low[c] = fmin(center_low[c], m);
+            center_high[c] = fmax(center_high[c], m);
+        }
+    }
+    if (count > 4) {
+        int axis = 0;
+        for (int c = 1; c < 3; c++)
+            if (center_high[c] - center_low[c] > center_high[axis] - center_low[axis])
+                axis = c;
+        if (center_high[axis] > center_low[axis]) {
+            sorting_world = w;
+            sorting_axis = axis;
+            qsort(w->order + first, (size_t)count, sizeof(int), by_center);
+            int half = count / 2;
+            int left = bvh_build(w, first, half);
+            int right = bvh_build(w, first + half, count - half);
+            node.left = left;
+            node.right = right;
+        }
+    }
+    w->nodes[index] = node; /* after the children: building them can move the array */
+    return index;
+}
+static void world_ready(World *w) {
+    if (!w->dirty)
+        return;
+    w->dirty = false;
+    w->node_count = 0;
+    w->order = realloc(w->order, (size_t)(w->count ? w->count : 1) * sizeof(int));
+    for (int i = 0; i < w->count; i++)
+        w->order[i] = i;
+    if (w->count > 0)
+        bvh_build(w, 0, w->count);
+}
+/* The enabled triangles whose bounds meet a box, into world_found. */
+static void world_query(World *w, const double *low, const double *high) {
+    world_ready(w);
+    world_found_count = 0;
+    if (w->count == 0)
+        return;
+    int stack[128], depth = 0;
+    stack[depth++] = 0;
+    while (depth > 0) {
+        const BvhNode *node = &w->nodes[stack[--depth]];
+        bool apart = false;
+        for (int c = 0; c < 3; c++)
+            if (node->low[c] > high[c] || node->high[c] < low[c])
+                apart = true;
+        if (apart)
+            continue;
+        if (node->left < 0) {
+            for (int i = node->first; i < node->first + node->count; i++) {
+                const Tri *t = &w->tris[w->order[i]];
+                if (w->off[t->group])
+                    continue;
+                double tl[3], th[3];
+                tri_bounds(t, tl, th);
+                if (tl[0] > high[0] || th[0] < low[0] || tl[1] > high[1] || th[1] < low[1] ||
+                    tl[2] > high[2] || th[2] < low[2])
+                    continue;
+                if (world_found_count == world_found_capacity) {
+                    world_found_capacity = world_found_capacity ? world_found_capacity * 2 : 256;
+                    world_found = realloc(world_found, (size_t)world_found_capacity * sizeof(int));
+                }
+                world_found[world_found_count++] = w->order[i];
+            }
+        } else if (depth + 2 <= 128) {
+            stack[depth++] = node->left;
+            stack[depth++] = node->right;
+        }
+    }
+}
+
+/* --- Closest points ------------------------------------------------------------------------ */
+/* The point of triangle abc closest to p (Ericson, Real-Time Collision Detection 5.1.5). */
+static void closest_on_triangle(double *out, const double *p, const double *a, const double *b,
+                                const double *c) {
+    double ab[3], ac[3], ap[3], bp[3], cp[3];
+    d3_sub(ab, b, a);
+    d3_sub(ac, c, a);
+    d3_sub(ap, p, a);
+    double d1 = d3_dot(ab, ap), d2 = d3_dot(ac, ap);
+    if (d1 <= 0 && d2 <= 0) {
+        d3_copy(out, a);
+        return;
+    }
+    d3_sub(bp, p, b);
+    double d3 = d3_dot(ab, bp), d4 = d3_dot(ac, bp);
+    if (d3 >= 0 && d4 <= d3) {
+        d3_copy(out, b);
+        return;
+    }
+    double vc = d1 * d4 - d3 * d2;
+    if (vc <= 0 && d1 >= 0 && d3 <= 0) {
+        d3_add_scaled(out, a, ab, d1 / (d1 - d3));
+        return;
+    }
+    d3_sub(cp, p, c);
+    double d5 = d3_dot(ab, cp), d6 = d3_dot(ac, cp);
+    if (d6 >= 0 && d5 <= d6) {
+        d3_copy(out, c);
+        return;
+    }
+    double vb = d5 * d2 - d1 * d6;
+    if (vb <= 0 && d2 >= 0 && d6 <= 0) {
+        d3_add_scaled(out, a, ac, d2 / (d2 - d6));
+        return;
+    }
+    double va = d3 * d6 - d5 * d4;
+    if (va <= 0 && d4 - d3 >= 0 && d5 - d6 >= 0) {
+        double bc[3];
+        d3_sub(bc, c, b);
+        d3_add_scaled(out, b, bc, (d4 - d3) / ((d4 - d3) + (d5 - d6)));
+        return;
+    }
+    double denominator = 1 / (va + vb + vc), v = vb * denominator, w = vc * denominator;
+    for (int i = 0; i < 3; i++)
+        out[i] = a[i] + ab[i] * v + ac[i] * w;
+}
+/* The closest points of segments p1q1 and p2q2 (Ericson 5.1.9). */
+static void closest_segments(double *c1, double *c2, const double *p1, const double *q1,
+                             const double *p2, const double *q2) {
+    double d1[3], d2[3], r[3];
+    d3_sub(d1, q1, p1);
+    d3_sub(d2, q2, p2);
+    d3_sub(r, p1, p2);
+    double a = d3_dot(d1, d1), e = d3_dot(d2, d2), f = d3_dot(d2, r), s, t;
+    if (a <= 1e-18 && e <= 1e-18) {
+        s = t = 0;
+    } else if (a <= 1e-18) {
+        s = 0;
+        t = clamp01(f / e);
+    } else {
+        double c = d3_dot(d1, r);
+        if (e <= 1e-18) {
+            t = 0;
+            s = clamp01(-c / a);
+        } else {
+            double b = d3_dot(d1, d2), denominator = a * e - b * b;
+            s = denominator > 1e-18 ? clamp01((b * f - c * e) / denominator) : 0;
+            t = (b * s + f) / e;
+            if (t < 0) {
+                t = 0;
+                s = clamp01(-c / a);
+            } else if (t > 1) {
+                t = 1;
+                s = clamp01((b - c) / a);
+            }
+        }
+    }
+    d3_add_scaled(c1, p1, d1, s);
+    d3_add_scaled(c2, p2, d2, t);
+}
+/* Where segment pq crosses the triangle (t along it), or -1. */
+static double segment_crosses(const Tri *tri, const double *p, const double *q) {
+    double d[3], e1[3], e2[3], h[3], s[3], k[3];
+    d3_sub(d, q, p);
+    d3_sub(e1, tri->b, tri->a);
+    d3_sub(e2, tri->c, tri->a);
+    d3_cross(h, d, e2);
+    double a = d3_dot(e1, h);
+    if (fabs(a) < 1e-14)
+        return -1;
+    double f = 1 / a;
+    d3_sub(s, p, tri->a);
+    double u = f * d3_dot(s, h);
+    if (u < 0 || u > 1)
+        return -1;
+    d3_cross(k, s, e1);
+    double v = f * d3_dot(d, k);
+    if (v < 0 || u + v > 1)
+        return -1;
+    double t = f * d3_dot(e2, k);
+    return t >= 0 && t <= 1 ? t : -1;
+}
+/* The closest points of segment pq (on_segment) and a triangle (on_tri); returns the distance. */
+static double segment_triangle(double *on_segment, double *on_tri, const Tri *tri,
+                               const double *p, const double *q) {
+    double t = segment_crosses(tri, p, q);
+    if (t >= 0) {
+        double d[3];
+        d3_sub(d, q, p);
+        d3_add_scaled(on_segment, p, d, t);
+        d3_copy(on_tri, on_segment);
+        return 0;
+    }
+    double best = INFINITY, cs[3], ct[3], gap[3];
+    const double *ends[2] = {p, q};
+    for (int i = 0; i < 2; i++) {
+        closest_on_triangle(ct, ends[i], tri->a, tri->b, tri->c);
+        d3_sub(gap, ends[i], ct);
+        double distance = d3_length(gap);
+        if (distance < best) {
+            best = distance;
+            d3_copy(on_segment, ends[i]);
+            d3_copy(on_tri, ct);
+        }
+    }
+    const double *corners[3] = {tri->a, tri->b, tri->c};
+    for (int i = 0; i < 3; i++) {
+        closest_segments(cs, ct, p, q, corners[i], corners[(i + 1) % 3]);
+        d3_sub(gap, cs, ct);
+        double distance = d3_length(gap);
+        if (distance < best) {
+            best = distance;
+            d3_copy(on_segment, cs);
+            d3_copy(on_tri, ct);
+        }
+    }
+    return best;
+}
+
+/* --- Queries ------------------------------------------------------------------------------- */
+/* The nearest triangle along a ray within `reach`: its distance, or -1. Results: the point
+   (0-2), the surface's normal facing the ray (3-5), and the group (6). */
+double ap_world_raycast(long id, double ox, double oy, double oz, double dx, double dy, double dz,
+                        double reach) {
+    World *w = world_of(id);
+    if (!w)
+        return -1;
+    double origin[3] = {ox, oy, oz}, direction[3] = {dx, dy, dz};
+    double length = d3_length(direction);
+    if (length < 1e-12 || reach <= 0)
+        return -1;
+    for (int i = 0; i < 3; i++)
+        direction[i] /= length;
+    world_ready(w);
+    if (w->count == 0)
+        return -1;
+    double best = reach;
+    int hit = -1;
+    int stack[128], depth = 0;
+    stack[depth++] = 0;
+    while (depth > 0) {
+        const BvhNode *node = &w->nodes[stack[--depth]];
+        double near = 0, far = best;
+        bool miss = false;
+        for (int c = 0; c < 3 && !miss; c++) {
+            if (fabs(direction[c]) < 1e-15) {
+                if (origin[c] < node->low[c] || origin[c] > node->high[c])
+                    miss = true;
+            } else {
+                double a = (node->low[c] - origin[c]) / direction[c];
+                double b = (node->high[c] - origin[c]) / direction[c];
+                near = fmax(near, fmin(a, b));
+                far = fmin(far, fmax(a, b));
+                if (near > far)
+                    miss = true;
+            }
+        }
+        if (miss)
+            continue;
+        if (node->left < 0) {
+            double end[3];
+            d3_add_scaled(end, origin, direction, best);
+            for (int i = node->first; i < node->first + node->count; i++) {
+                const Tri *t = &w->tris[w->order[i]];
+                if (w->off[t->group])
+                    continue;
+                double along = segment_crosses(t, origin, end);
+                if (along >= 0 && along * best < best) {
+                    best *= along;
+                    hit = w->order[i];
+                    d3_add_scaled(end, origin, direction, best);
+                }
+            }
+        } else if (depth + 2 <= 128) {
+            stack[depth++] = node->left;
+            stack[depth++] = node->right;
+        }
+    }
+    if (hit < 0)
+        return -1;
+    const Tri *t = &w->tris[hit];
+    double facing = d3_dot(t->n, direction) > 0 ? -1 : 1;
+    for (int i = 0; i < 3; i++) {
+        world_results[i] = origin[i] + direction[i] * best;
+        world_results[3 + i] = t->n[i] * facing;
+    }
+    world_results[6] = t->group;
+    return best;
+}
+/* How deep a sphere is in the nearest surface (0 when clear); results 0-2 the way out. */
+static double sphere_depth(World *w, const double *center, double radius, double *out) {
+    double low[3], high[3];
+    for (int c = 0; c < 3; c++)
+        low[c] = center[c] - radius, high[c] = center[c] + radius;
+    world_query(w, low, high);
+    double deepest = 0;
+    for (int i = 0; i < world_found_count; i++) {
+        const Tri *t = &w->tris[world_found[i]];
+        double q[3], gap[3];
+        closest_on_triangle(q, center, t->a, t->b, t->c);
+        d3_sub(gap, center, q);
+        double distance = d3_length(gap);
+        if (distance < radius && radius - distance > deepest) {
+            deepest = radius - distance;
+            if (out) {
+                if (distance > 1e-9)
+                    for (int c = 0; c < 3; c++)
+                        out[c] = gap[c] / distance;
+                else
+                    d3_copy(out, t->n);
+            }
+        }
+    }
+    return deepest;
+}
+bool ap_world_overlaps(long id, double x, double y, double z, double radius) {
+    World *w = world_of(id);
+    double center[3] = {x, y, z};
+    return w && sphere_depth(w, center, radius, NULL) > 0;
+}
+/* How far (0 to 1) a sphere moves from one point toward another before touching anything
+   (1 when it gets there): for cameras that should not go through walls, and thrown things. */
+double ap_world_sweep(long id, double fx, double fy, double fz, double tx, double ty, double tz,
+                      double radius) {
+    World *w = world_of(id);
+    if (!w || radius <= 0)
+        return 1;
+    double from[3] = {fx, fy, fz}, to[3] = {tx, ty, tz}, d[3], p[3];
+    d3_sub(d, to, from);
+    if (sphere_depth(w, from, radius, NULL) > 0)
+        return 0;
+    double length = d3_length(d);
+    int steps = (int)ceil(length / (radius * 0.5));
+    if (steps < 1)
+        steps = 1;
+    if (steps > 4096)
+        steps = 4096;
+    double clear = 0;
+    for (int i = 1; i <= steps; i++) {
+        double t = (double)i / steps;
+        d3_add_scaled(p, from, d, t);
+        if (sphere_depth(w, p, radius, NULL) > 0) {
+            double blocked = t;
+            for (int k = 0; k < 10; k++) {
+                double mid = (clear + blocked) / 2;
+                d3_add_scaled(p, from, d, mid);
+                if (sphere_depth(w, p, radius, NULL) > 0)
+                    blocked = mid;
+                else
+                    clear = mid;
+            }
+            return clear;
+        }
+        clear = t;
+    }
+    return 1;
+}
+
+/* --- Moving capsules ------------------------------------------------------------------------ */
+/* An upright capsule standing on `position` (its lowest point). */
+typedef struct {
+    double radius, height, slope; /* slope: the cosine of the steepest walkable surface */
+    double step;                  /* edges of walkable ground this high count as ground */
+} Capsule;
+typedef struct {
+    bool ground, wall, ceiling;
+    double ground_normal[3], wall_normal[3];
+    int ground_group;
+} Contacts;
+static void capsule_segment(const Capsule *k, const double *position, double *p, double *q) {
+    double top = fmax(k->height - k->radius, k->radius);
+    p[0] = q[0] = position[0];
+    p[2] = q[2] = position[2];
+    p[1] = position[1] + k->radius;
+    q[1] = position[1] + top;
+}
+/* Pushes a capsule out of everything it is inside, deepest first, and says what it touched.
+   On walkable ground the push is straight up, so standing on a slope does not slide down it.
+   The rounded bottom touching the edge of walkable ground no higher than `step` (a stair) is
+   on that ground too, and lifted straight up onto it, so stairs are climbed smoothly. */
+static void capsule_resolve(World *w, const Capsule *k, double *position, Contacts *contacts) {
+    /* Wide enough for every push the passes below can make. */
+    double margin = k->radius * 2 + 0.05;
+    double low[3] = {position[0] - margin, position[1] - margin, position[2] - margin};
+    double high[3] = {position[0] + margin, position[1] + k->height + margin,
+                      position[2] + margin};
+    world_query(w, low, high);
+    for (int pass = 0; pass < 8; pass++) {
+        double p[3], q[3], deepest = 0, way[3] = {0, 1, 0}, lift = 0;
+        int which = -1;
+        bool ledge = false;
+        capsule_segment(k, position, p, q);
+        for (int i = 0; i < world_found_count; i++) {
+            const Tri *t = &w->tris[world_found[i]];
+            double on_segment[3], on_tri[3], gap[3], n[3];
+            double distance = segment_triangle(on_segment, on_tri, t, p, q);
+            if (distance >= k->radius)
+                continue;
+            if (distance > 1e-9) {
+                d3_sub(gap, on_segment, on_tri);
+                for (int c = 0; c < 3; c++)
+                    n[c] = gap[c] / distance;
+            } else {
+                /* The segment passes through the triangle: out the side its middle is on. */
+                double middle[3] = {(p[0] + q[0]) / 2, (p[1] + q[1]) / 2, (p[2] + q[2]) / 2};
+                d3_sub(gap, middle, t->a);
+                double side = d3_dot(gap, t->n) >= 0 ? 1 : -1;
+                for (int c = 0; c < 3; c++)
+                    n[c] = t->n[c] * side;
+            }
+            double depth = k->radius - distance;
+            /* An edge under the bottom sphere, of a surface that is walkable, low enough. */
+            bool on_edge = false;
+            double up = 0;
+            if (n[1] < k->slope && on_segment[1] <= p[1] + 1e-9 && on_tri[1] < on_segment[1] &&
+                on_tri[1] <= position[1] + k->step) {
+                double middle[3] = {(p[0] + q[0]) / 2, (p[1] + q[1]) / 2, (p[2] + q[2]) / 2};
+                d3_sub(gap, middle, t->a);
+                double face_up = t->n[1] * (d3_dot(gap, t->n) >= 0 ? 1 : -1);
+                if (face_up >= k->slope) {
+                    double dx = on_segment[0] - on_tri[0], dz = on_segment[2] - on_tri[2];
+                    double across = dx * dx + dz * dz, r2 = k->radius * k->radius;
+                    if (across < r2) {
+                        on_edge = true;
+                        up = sqrt(r2 - across) - (on_segment[1] - on_tri[1]);
+                    }
+                }
+            }
+            /* Deepest first; at the same depth, an edge to stand on before a wall. */
+            if (depth > deepest + 1e-9 || (on_edge && !ledge && depth > deepest - 1e-9)) {
+                deepest = depth;
+                d3_copy(way, n);
+                which = world_found[i];
+                ledge = on_edge;
+                lift = up;
+            }
+        }
+        if (which < 0)
+            return;
+        double push = deepest + 1e-6;
+        if (ledge) {
+            position[1] += lift + 1e-6;
+            contacts->ground = true;
+            double flat[3] = {0, 1, 0};
+            d3_copy(contacts->ground_normal, flat);
+            contacts->ground_group = w->tris[which].group;
+        } else if (way[1] >= k->slope) {
+            /* walkable: straight up by as much as the slope needs */
+            position[1] += fmin(push / way[1], push * 4);
+            contacts->ground = true;
+            d3_copy(contacts->ground_normal, way);
+            contacts->ground_group = w->tris[which].group;
+        } else {
+            d3_add_scaled(position, position, way, push);
+            if (way[1] < -0.5) {
+                contacts->ceiling = true;
+            } else {
+                contacts->wall = true;
+                d3_copy(contacts->wall_normal, way);
+            }
+        }
+    }
+}
+static bool capsule_clear(World *w, const Capsule *k, const double *position) {
+    double at[3];
+    Contacts ignored = {0};
+    d3_copy(at, position);
+    capsule_resolve(w, k, at, &ignored);
+    return !ignored.ground && !ignored.wall && !ignored.ceiling;
+}
+/* Moves by `motion` in steps of at most half the radius, pushing out after each and taking out
+   the part of the remaining motion that goes into what it hit. */
+static void capsule_slide(World *w, const Capsule *k, double *position, const double *motion,
+                          Contacts *contacts) {
+    double left[3];
+    d3_copy(left, motion);
+    double length = d3_length(left);
+    int steps = (int)ceil(length / (k->radius * 0.5));
+    if (steps < 1)
+        steps = 1;
+    if (steps > 256)
+        steps = 256;
+    for (int i = 0; i < steps; i++) {
+        double step[3];
+        for (int c = 0; c < 3; c++)
+            step[c] = left[c] / (steps - i);
+        d3_add_scaled(position, position, step, 1);
+        for (int c = 0; c < 3; c++)
+            left[c] -= step[c];
+        Contacts now = {0};
+        capsule_resolve(w, k, position, &now);
+        if (now.wall) {
+            /* Walls (and slopes too steep to walk) stop horizontal motion into them only, so
+               walking into a steep slope does not climb it. */
+            double n[3] = {now.wall_normal[0], 0, now.wall_normal[2]};
+            double flat = d3_length(n);
+            if (flat > 1e-9) {
+                for (int c = 0; c < 3; c++)
+                    n[c] /= flat;
+                double into = d3_dot(left, n);
+                if (into < 0)
+                    d3_add_scaled(left, left, n, -into);
+            }
+            contacts->wall = true;
+            d3_copy(contacts->wall_normal, now.wall_normal);
+        }
+        if (now.ceiling) {
+            if (left[1] > 0)
+                left[1] = 0;
+            contacts->ceiling = true;
+        }
+        if (now.ground) {
+            if (left[1] < 0)
+                left[1] = 0;
+            contacts->ground = true;
+            d3_copy(contacts->ground_normal, now.ground_normal);
+            contacts->ground_group = now.ground_group;
+        }
+    }
+}
+/* Looks below for walkable ground within `reach` and stands on it. */
+static bool capsule_settle(World *w, const Capsule *k, double *position, double reach,
+                           Contacts *contacts) {
+    double probe = fmax(k->radius * 0.25, 0.01), went = 0, at[3];
+    d3_copy(at, position);
+    while (went < reach) {
+        double step = fmin(probe, reach - went);
+        at[1] -= step;
+        went += step;
+        if (capsule_clear(w, k, at))
+            continue;
+        /* Find where it first touches, so a rounded bottom meeting an edge is judged by the
+           surface at the touch, not by how far a probe went into it. */
+        double clear = at[1] + step, blocked = at[1];
+        for (int i = 0; i < 12; i++) {
+            double mid[3] = {at[0], (clear + blocked) / 2, at[2]};
+            if (capsule_clear(w, k, mid))
+                clear = mid[1];
+            else
+                blocked = mid[1];
+        }
+        double touch[3] = {at[0], clear - 1e-4, at[2]};
+        Contacts now = {0};
+        capsule_resolve(w, k, touch, &now);
+        if (!now.ground)
+            return false;
+        d3_copy(position, touch);
+        contacts->ground = true;
+        d3_copy(contacts->ground_normal, now.ground_normal);
+        contacts->ground_group = now.ground_group;
+        return true;
+    }
+    return false;
+}
+/* Moves an upright capsule standing at (x, y, z) by `motion`: it slides along walls, stands
+   on surfaces up to `slope_degrees` steep, climbs steps up to `step` high while it was on the
+   ground, and, when it was on the ground and is not jumping, follows the ground down up to
+   `snap`. Results: the new position (0-2), on the ground (3), the ground's normal (4-6),
+   touched a wall (7), the wall's normal (8-10), touched a ceiling (11), the ground's group
+   (12). */
+void ap_world_move(long id, double x, double y, double z, double mx, double my, double mz,
+                   double radius, double height, double slope_degrees, double step, double snap,
+                   bool was_grounded) {
+    memset(world_results, 0, sizeof world_results);
+    world_results[0] = x, world_results[1] = y, world_results[2] = z;
+    World *w = world_of(id);
+    if (!w)
+        return;
+    if (radius <= 0) {
+        fail("a moving capsule needs a radius above 0");
+        return;
+    }
+    Capsule k = {radius, fmax(height, 2 * radius),
+                 cos(fmin(fmax(slope_degrees, 0), 89.9) * M_PI / 180),
+                 was_grounded ? fmax(step, 0) : 0};
+    double position[3] = {x, y, z}, motion[3] = {mx, my, mz};
+    Contacts contacts = {0};
+    capsule_slide(w, &k, position, motion, &contacts);
+
+    /* Steps: when a wall stopped a grounded capsule, try the same move from `step` higher and
+       come back down onto the step; keep it when it went further across. */
+    double flat_motion = sqrt(mx * mx + mz * mz);
+    if (contacts.wall && was_grounded && step > 0 && flat_motion > 1e-9 && my <= 1e-9) {
+        double start[3] = {x, y, z}, up[3], across[3] = {mx, 0, mz};
+        d3_copy(up, start);
+        up[1] += step;
+        if (capsule_clear(w, &k, up)) {
+            Contacts high = {0};
+            capsule_slide(w, &k, up, across, &high);
+            Contacts landing = {0};
+            if (capsule_settle(w, &k, up, step + 0.01, &landing)) {
+                double before = (position[0] - x) * mx + (position[2] - z) * mz;
+                double after = (up[0] - x) * mx + (up[2] - z) * mz;
+                if (after > before + 1e-4 * flat_motion && up[1] - y <= step + 1e-6) {
+                    d3_copy(position, up);
+                    contacts = landing;
+                    contacts.wall = high.wall;
+                    d3_copy(contacts.wall_normal, high.wall_normal);
+                }
+            }
+        }
+    }
+    /* Down slopes and stairs: stay on the ground. */
+    if (!contacts.ground && was_grounded && snap > 0 && my <= 1e-9)
+        capsule_settle(w, &k, position, snap, &contacts);
+    /* Resting on the ground counts as on it, though nothing pushed this frame. */
+    if (!contacts.ground && my <= 1e-9) {
+        double below[3] = {position[0], position[1] - 0.002, position[2]};
+        Contacts touch = {0};
+        capsule_resolve(w, &k, below, &touch);
+        if (touch.ground) {
+            contacts.ground = true;
+            d3_copy(contacts.ground_normal, touch.ground_normal);
+            contacts.ground_group = touch.ground_group;
+        }
+    }
+    d3_copy(world_results, position);
+    world_results[3] = contacts.ground;
+    d3_copy(world_results + 4, contacts.ground_normal);
+    world_results[7] = contacts.wall;
+    d3_copy(world_results + 8, contacts.wall_normal);
+    world_results[11] = contacts.ceiling;
+    world_results[12] = contacts.ground_group;
+}
+double ap_world_result(long index) {
+    return index >= 0 && index < 16 ? world_results[index] : 0;
+}
+/* Draws every enabled triangle's edges (for debugging). */
+void ap_world_draw(long id, long r, long g, long b, long a) {
+    World *w = world_of(id);
+    if (!w || !in3d())
+        return;
+    for (int i = 0; i < w->count; i++) {
+        const Tri *t = &w->tris[i];
+        if (w->off[t->group])
+            continue;
+        ap_line3d(t->a[0], t->a[1], t->a[2], t->b[0], t->b[1], t->b[2], r, g, b, a);
+        ap_line3d(t->b[0], t->b[1], t->b[2], t->c[0], t->c[1], t->c[2], r, g, b, a);
+        ap_line3d(t->c[0], t->c[1], t->c[2], t->a[0], t->a[1], t->a[2], r, g, b, a);
+    }
+}
+
 /* --- Audio --------------------------------------------------------------------------------- */
 /* The music track (see ap_music_play). */
 static struct {
@@ -3721,12 +4676,24 @@ static void audio_close(void) {
         SDL_CloseAudioDevice(A.audio);
     A.audio = 0;
 }
-/* Refills looping voices and frees the ones that finished. */
+static void spatial_aim(Voice *voice);
+/* Refills looping voices, aims voices in space, and frees the ones that finished. */
 static void audio_update(void) {
     for (int i = 0; i < AP_MAX_VOICES; i++) {
         Voice *voice = &A.voices[i];
         if (!voice->stream)
             continue;
+        if (voice->spatial) {
+            SDL_LockAudioStream(voice->stream);
+            spatial_aim(voice);
+            bool finished = voice->finished;
+            SDL_UnlockAudioStream(voice->stream);
+            if (finished && SDL_GetAudioStreamAvailable(voice->stream) <= 0) {
+                SDL_DestroyAudioStream(voice->stream);
+                voice->stream = NULL;
+            }
+            continue;
+        }
         Sound *sound = &A.sounds[voice->sound];
         int queued = SDL_GetAudioStreamQueued(voice->stream);
         if (voice->looping && sound->used) {
@@ -3863,6 +4830,7 @@ long ap_sound_play(long id, double volume, double pitch, bool loop) {
         Voice *voice = &A.voices[i];
         if (voice->stream)
             continue;
+        memset(voice, 0, sizeof *voice);
         voice->stream = SDL_CreateAudioStream(&sound->spec, NULL);
         if (!voice->stream || !SDL_BindAudioStream(A.audio, voice->stream)) {
             if (voice->stream)
@@ -3880,6 +4848,190 @@ long ap_sound_play(long id, double volume, double pitch, bool loop) {
         return i + 1;
     }
     return 0;
+}
+/* --- Sound in space ------------------------------------------------------------------------ */
+/* Where the listener is and which way it faces (y is up); voices in space follow at once. */
+void ap_listener(double x, double y, double z, double fx, double fy, double fz) {
+    A.listener[0] = (float)x, A.listener[1] = (float)y, A.listener[2] = (float)z;
+    float forward[3] = {(float)fx, (float)fy, (float)fz}, up[3] = {0, 1, 0}, right[3];
+    if (forward[0] * forward[0] + forward[1] * forward[1] + forward[2] * forward[2] < 1e-12f)
+        return;
+    v3_normalize(forward);
+    v3_cross(right, forward, up);
+    /* Looking straight up or down keeps the last right-hand direction. */
+    if (right[0] * right[0] + right[2] * right[2] > 1e-8f) {
+        right[1] = 0;
+        v3_normalize(right);
+        memcpy(A.listener_right, right, sizeof right);
+    }
+    memcpy(A.listener_forward, forward, sizeof forward);
+    for (int i = 0; i < AP_MAX_VOICES; i++)
+        if (A.voices[i].stream && A.voices[i].spatial) {
+            SDL_LockAudioStream(A.voices[i].stream);
+            spatial_aim(&A.voices[i]);
+            SDL_UnlockAudioStream(A.voices[i].stream);
+        }
+}
+/* How loud a voice in space is in each ear, and how muffled, for where it is: full volume
+   within `near`, falling off with distance (inverse, as sound does) and fading to silence at
+   `far`; panned between the ears with equal power, never fully into one ear; and quieter and
+   darker behind the listener, so front and back can be told apart. Called with the voice's
+   stream locked. */
+static void spatial_aim(Voice *voice) {
+    float d[3] = {voice->position[0] - A.listener[0], voice->position[1] - A.listener[1],
+                  voice->position[2] - A.listener[2]};
+    float distance = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    float gain = 1, side = 0, ahead = 1;
+    if (distance > 1e-4f) {
+        if (distance > voice->near)
+            gain = voice->near / distance;
+        if (voice->far > voice->near) {
+            float fade = (voice->far - distance) / (voice->far - voice->near);
+            gain *= fminf(fmaxf(fade * 4, 0), 1); /* the last quarter fades out */
+        }
+        side = (d[0] * A.listener_right[0] + d[1] * A.listener_right[1] +
+                d[2] * A.listener_right[2]) / distance;
+        ahead = (d[0] * A.listener_forward[0] + d[1] * A.listener_forward[1] +
+                 d[2] * A.listener_forward[2]) / distance;
+        /* Very close sounds are heard more evenly by both ears. */
+        float closeness = fminf(distance / fmaxf(voice->near * 0.5f, 1e-3f), 1);
+        side *= closeness;
+        ahead = ahead * closeness + (1 - closeness);
+    }
+    float behind = fmaxf(-ahead, 0);
+    gain *= 1 - 0.3f * behind;
+    float angle = (side * 0.85f + 1) * (float)M_PI / 4;
+    voice->left = cosf(angle) * gain * (float)M_SQRT2;
+    voice->right = sinf(angle) * gain * (float)M_SQRT2;
+    voice->cutoff = behind;
+}
+/* Feeds a voice in space: the next samples of its sound, low-passed when behind the listener
+   and spread over the two ears, gliding to the latest targets so moving sounds do not click.
+   Runs on the audio thread with the stream locked. */
+static void SDLCALL spatial_feed(void *userdata, SDL_AudioStream *stream, int additional,
+                                 int total) {
+    (void)total;
+    Voice *voice = (Voice *)userdata;
+    if (voice->finished || voice->sound <= 0 || !A.sounds[voice->sound].mono)
+        return;
+    const Sound *sound = &A.sounds[voice->sound];
+    float rate = sound->spec.freq > 0 ? (float)sound->spec.freq : 44100;
+    float chunk[512 * 2];
+    float glide = 1 - expf(-1 / (0.01f * rate)); /* about 10 ms to reach a new target */
+    int wanted = additional / (int)(2 * sizeof(float));
+    while (wanted > 0 && !voice->finished) {
+        int n = wanted < 512 ? wanted : 512, made = 0;
+        for (; made < n; made++) {
+            if (voice->at >= sound->mono_frames) {
+                if (!voice->looping || sound->mono_frames == 0) {
+                    voice->finished = true;
+                    break;
+                }
+                voice->at = 0;
+            }
+            voice->heard_left += (voice->left - voice->heard_left) * glide;
+            voice->heard_right += (voice->right - voice->heard_right) * glide;
+            voice->heard_cutoff += (voice->cutoff - voice->heard_cutoff) * glide;
+            /* One pole: open at 18 kHz in front, about 2.5 kHz straight behind. */
+            float hz = 18000 - 15500 * voice->heard_cutoff;
+            float a = 1 - expf(-2 * (float)M_PI * hz / rate);
+            voice->filter += (sound->mono[voice->at++] - voice->filter) * a;
+            chunk[made * 2] = voice->filter * voice->heard_left;
+            chunk[made * 2 + 1] = voice->filter * voice->heard_right;
+        }
+        if (made > 0)
+            SDL_PutAudioStreamData(stream, chunk, made * (int)(2 * sizeof(float)));
+        wanted -= n;
+    }
+    if (voice->finished)
+        SDL_FlushAudioStream(stream);
+}
+/* The sound as float mono, for playing in space (stereo files are mixed down). */
+static bool sound_mono(Sound *sound) {
+    if (sound->mono)
+        return true;
+    SDL_AudioSpec mono = {SDL_AUDIO_F32, 1, sound->spec.freq};
+    Uint8 *out = NULL;
+    int bytes = 0;
+    if (!SDL_ConvertAudioSamples(&sound->spec, sound->data, (int)sound->length, &mono, &out,
+                                 &bytes))
+        return false;
+    sound->mono = (float *)out;
+    sound->mono_frames = (Uint32)(bytes / (int)sizeof(float));
+    return true;
+}
+/* Plays a sound at a point in space and returns its voice (0 when none is free or there is no
+   audio device). Full volume within `near`, silent beyond `far`. */
+long ap_sound_play_at(long id, double x, double y, double z, double volume, double pitch,
+                      bool loop, double near, double far) {
+    if (!ready())
+        return 0;
+    if (id <= 0 || id >= AP_MAX_SOUNDS || !A.sounds[id].used) {
+        fail("playing a sound that is not loaded (or was freed)");
+        return 0;
+    }
+    if (!audio_open())
+        return 0;
+    Sound *sound = &A.sounds[id];
+    if (!sound_mono(sound)) {
+        fail("cannot play the sound in space: %s", SDL_GetError());
+        return 0;
+    }
+    for (int i = 0; i < AP_MAX_VOICES; i++) {
+        Voice *voice = &A.voices[i];
+        if (voice->stream)
+            continue;
+        memset(voice, 0, sizeof *voice);
+        voice->sound = (int)id;
+        voice->looping = loop;
+        voice->spatial = true;
+        voice->position[0] = (float)x, voice->position[1] = (float)y, voice->position[2] = (float)z;
+        voice->near = (float)fmax(near, 0.01);
+        voice->far = (float)fmax(far, 0);
+        spatial_aim(voice);
+        voice->heard_left = voice->left;
+        voice->heard_right = voice->right;
+        voice->heard_cutoff = voice->cutoff;
+        SDL_AudioSpec spec = {SDL_AUDIO_F32, 2, sound->spec.freq};
+        voice->stream = SDL_CreateAudioStream(&spec, NULL);
+        if (!voice->stream) {
+            voice->spatial = false;
+            return 0;
+        }
+        SDL_SetAudioStreamGain(voice->stream, (float)(fmax(volume, 0) * A.master_volume));
+        SDL_SetAudioStreamFrequencyRatio(voice->stream, (float)fmin(fmax(pitch, 0.05), 8));
+        SDL_SetAudioStreamGetCallback(voice->stream, spatial_feed, voice);
+        if (!SDL_BindAudioStream(A.audio, voice->stream)) {
+            SDL_DestroyAudioStream(voice->stream);
+            voice->stream = NULL;
+            voice->spatial = false;
+            return 0;
+        }
+        return i + 1;
+    }
+    return 0;
+}
+static Voice *voice_of(long voice);
+/* Moves a voice in space (a sound that travels with its source). */
+void ap_voice_move(long id, double x, double y, double z) {
+    Voice *voice = voice_of(id);
+    if (!voice || !voice->spatial)
+        return;
+    SDL_LockAudioStream(voice->stream);
+    voice->position[0] = (float)x, voice->position[1] = (float)y, voice->position[2] = (float)z;
+    spatial_aim(voice);
+    SDL_UnlockAudioStream(voice->stream);
+}
+/* The ear gains a voice in space has now: results 0 (left) and 1 (right), and 2 how muffled it
+   is (0 in front, 1 straight behind). */
+void ap_voice_ears(long id) {
+    Voice *voice = voice_of(id);
+    A.result[0] = A.result[1] = A.result[2] = 0;
+    if (!voice || !voice->spatial)
+        return;
+    SDL_LockAudioStream(voice->stream);
+    A.result[0] = voice->left, A.result[1] = voice->right, A.result[2] = voice->cutoff;
+    SDL_UnlockAudioStream(voice->stream);
 }
 static Voice *voice_of(long voice) {
     return voice > 0 && voice <= AP_MAX_VOICES && A.voices[voice - 1].stream ? &A.voices[voice - 1]
@@ -4069,5 +5221,6 @@ void ap_sound_free(long id) {
             A.voices[i].stream = NULL;
         }
     SDL_free(A.sounds[id].data);
+    SDL_free(A.sounds[id].mono);
     memset(&A.sounds[id], 0, sizeof A.sounds[id]);
 }

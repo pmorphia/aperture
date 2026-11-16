@@ -1,0 +1,277 @@
+# Collision worlds, bodies, and sound in space.
+#
+# Runs without a visible window. On a machine with no display, set SDL_VIDEODRIVER=offscreen
+# (and SDL_AUDIODRIVER=dummy when there is no sound card).
+import "../aperture.fw" as ap
+import math
+import testing
+import time
+
+private function close_to(double actual, double expected, double tolerance = 0.0001) returns bool
+    return math.abs(actual - expected) <= tolerance
+end
+
+function setup_all
+    ap.open("aperture collision tests", 320, 200, ap.HIDDEN + ap.NO_VSYNC)
+    ap.fixed_delta(1.0 / 60)
+end
+function teardown_all
+    ap.fixed_delta(0)
+    ap.close()
+end
+
+# A floor 40 wide with its top at y = 0.
+private function floor_world() returns ap.World
+    var world = ap.World()
+    world.add_box(ap.Vec3(-20, -1, -20), ap.Vec3(20, 0, 20))
+    return world
+end
+private function settle(ap.Body body, ap.World world, int ticks = 120)
+    for i in 0..<ticks do
+        body.update(world)
+    end
+end
+
+function test_falls_onto_the_floor
+    var world = floor_world()
+    testing.assert_equal(world.triangles(), 12)
+    var body = ap.Body(ap.Vec3(0, 3, 0))
+    settle(body, world)
+    testing.assert(body.grounded)
+    testing.assert(close_to(body.position.y, 0, 0.01))
+    testing.assert(close_to(body.ground_normal.y, 1, 0.001))
+    testing.assert(close_to(body.velocity.y, 0))
+end
+
+function test_walls_stop_and_slide
+    var world = floor_world()
+    world.add_box(ap.Vec3(2, 0, -10), ap.Vec3(3, 3, 10))
+    var body = ap.Body(ap.Vec3(0, 0, 0))
+    settle(body, world, 10)
+    for i in 0..<120 do
+        body.move(world, ap.Vec3(0.1, 0, 0))
+    end
+    testing.assert(body.hit_wall)
+    testing.assert(close_to(body.position.x, 2 - body.radius, 0.01))
+    testing.assert(close_to(body.wall_normal.x, -1, 0.001))
+    # Moving into the wall at a slant keeps the part along it.
+    var z = body.position.z
+    body.move(world, ap.Vec3(0.1, 0, 0.1))
+    testing.assert(close_to(body.position.x, 2 - body.radius, 0.01))
+    testing.assert(close_to(body.position.z, z + 0.1, 0.001))
+end
+
+# A ramp rising along +x at `degrees`, from x = 0 to x = 10.
+private function ramp(ap.World world, double degrees)
+    var rise = math.tan(degrees * math.PI / 180) * 10
+    world.add_triangles([ap.Vec3(0, 0, -5), ap.Vec3(10, rise, 5), ap.Vec3(10, rise, -5),
+        ap.Vec3(0, 0, -5), ap.Vec3(0, 0, 5), ap.Vec3(10, rise, 5)])
+end
+
+function test_stands_on_walkable_slopes
+    var world = floor_world()
+    ramp(world, 30)
+    var body = ap.Body(ap.Vec3(5, 4, 0))
+    settle(body, world)
+    testing.assert(body.grounded)
+    var x = body.position.x
+    settle(body, world, 120)
+    testing.assert(close_to(body.position.x, x, 0.001))  # does not slide down
+    testing.assert(close_to(body.ground_normal.y, math.cos(30 * math.PI / 180), 0.01))
+    # Walking up it climbs.
+    var y = body.position.y
+    for i in 0..<20 do
+        body.move(world, ap.Vec3(0.05, 0, 0))
+    end
+    testing.assert(body.position.y > y + 0.4)
+end
+
+function test_steep_slopes_are_walls
+    var world = floor_world()
+    ramp(world, 70)
+    var body = ap.Body(ap.Vec3(-1, 0, 0))
+    settle(body, world, 10)
+    for i in 0..<100 do
+        body.velocity = ap.Vec3(3, body.velocity.y, 0)
+        body.update(world)
+    end
+    testing.assert(body.position.y < 0.5)
+    testing.assert(body.position.x < 0.5)
+end
+
+function test_climbs_steps
+    var world = floor_world()
+    world.add_box(ap.Vec3(1, 0, -5), ap.Vec3(3, 0.2, 5))      # low enough
+    world.add_box(ap.Vec3(5, 0, -5), ap.Vec3(7, 0.6, 5))      # too high
+    var body = ap.Body(ap.Vec3(0, 0, 0))
+    settle(body, world, 10)
+    for i in 0..<30 do
+        body.velocity = ap.Vec3(3, body.velocity.y, 0)
+        body.update(world)
+    end
+    testing.assert(body.grounded)
+    testing.assert(close_to(body.position.y, 0.2, 0.01))
+    for i in 0..<120 do
+        body.velocity = ap.Vec3(3, body.velocity.y, 0)
+        body.update(world)
+    end
+    testing.assert(close_to(body.position.x, 5 - body.radius, 0.02))
+    testing.assert(body.position.y < 0.25)
+end
+
+function test_follows_the_ground_down
+    var world = floor_world()
+    world.add_box(ap.Vec3(-5, 0, -5), ap.Vec3(1, 0.25, 5))    # a ledge to walk off
+    var body = ap.Body(ap.Vec3(0, 0.25, 0))
+    settle(body, world, 10)
+    body.move(world, ap.Vec3(1.5, 0, 0))
+    testing.assert(body.grounded)                            # snapped down, not in the air
+    testing.assert(close_to(body.position.y, 0, 0.01))
+    # Jumping is not snapped back.
+    body.velocity = ap.Vec3(0, 6, 0)
+    body.update(world)
+    testing.assert(not body.grounded)
+    testing.assert(body.position.y > 0.05)
+end
+
+function test_ceilings
+    var world = floor_world()
+    world.add_box(ap.Vec3(-5, 2.2, -5), ap.Vec3(5, 3, 5))
+    var body = ap.Body(ap.Vec3(0, 0, 0))
+    settle(body, world, 10)
+    body.velocity = ap.Vec3(0, 10, 0)
+    for i in 0..<10 do
+        body.update(world)
+    end
+    testing.assert(body.top().y <= 2.2 + 0.001)
+end
+
+function test_rays_groups_and_sweeps
+    var world = floor_world()
+    var door = world.add_box(ap.Vec3(-1, 0, -3), ap.Vec3(1, 2, -2.8))
+    var hit = world.raycast(ap.Ray(ap.Vec3(0, 5, 0), ap.Vec3(0, -1, 0)))
+    testing.assert(hit.found)
+    testing.assert(close_to(hit.distance, 5))
+    testing.assert(close_to(hit.normal.y, 1))
+    testing.assert(hit.group != door)
+    var ahead = world.raycast(ap.Ray(ap.Vec3(0, 1, 0), ap.Vec3(0, 0, -1)))
+    testing.assert(ahead.found and ahead.group == door)
+    testing.assert(close_to(ahead.point.z, -2.8))
+    testing.assert(close_to(ahead.normal.z, 1))
+    testing.assert(not world.raycast(ap.Ray(ap.Vec3(0, 1, 0), ap.Vec3(0, 0, -1)), 2).found)
+    testing.assert(not world.sees(ap.Vec3(0, 1, 0), ap.Vec3(0, 1, -5)))
+    world.enable(door, false)
+    testing.assert(world.sees(ap.Vec3(0, 1, 0), ap.Vec3(0, 1, -5)))
+    testing.assert(not world.raycast(ap.Ray(ap.Vec3(0, 1, 0), ap.Vec3(0, 0, -1)), 10).found)
+    world.enable(door)
+    testing.assert(world.overlaps(ap.Vec3(0, 1, -2.5), 0.4))
+    testing.assert(not world.overlaps(ap.Vec3(0, 1, -2), 0.4))
+    # From z = 2 to -4, the sphere touches the door's face (z = -2.8) with its center at -2.3.
+    var reach = world.sweep(ap.Vec3(0, 1, 2), ap.Vec3(0, 1, -4), 0.5)
+    testing.assert(close_to(reach, 4.3 / 6, 0.002))
+    world.remove(door)
+    testing.assert_equal(world.triangles(), 12)
+    testing.assert_equal(world.sweep(ap.Vec3(0, 1, 2), ap.Vec3(0, 1, -4), 0.5), 1.0)
+    world.clear()
+    testing.assert_equal(world.triangles(), 0)
+    testing.assert(not world.raycast(ap.Ray(ap.Vec3(0, 5, 0), ap.Vec3(0, -1, 0))).found)
+end
+
+function test_meshes_and_turned_boxes
+    var world = ap.World()
+    world.add_mesh(ap.cube(2, 1, 2), ap.Vec3(0, -0.5, 0), ap.Vec3(0, 0, 0), ap.Vec3(10, 1, 10))
+    testing.assert_equal(world.triangles(), 12)
+    var down = world.raycast(ap.Ray(ap.Vec3(9, 3, 9), ap.Vec3(0, -1, 0)))
+    testing.assert(down.found and close_to(down.point.y, 0, 0.0001))
+    testing.assert(not world.raycast(ap.Ray(ap.Vec3(11, 3, 0), ap.Vec3(0, -1, 0))).found)
+    # A box turned 45 degrees: its corner points along +x.
+    world.add_cube(ap.Vec3(0, 3, 0), ap.Vec3(1, 1, 1), ap.Vec3(0, 45, 0))
+    var side = world.raycast(ap.Ray(ap.Vec3(5, 3, 0), ap.Vec3(-1, 0, 0)))
+    testing.assert(close_to(side.point.x, math.sqrt(0.5), 0.0001))
+    var sphere = ap.sphere(1)
+    var world2 = ap.World()
+    world2.add_mesh(sphere, ap.Vec3(0, 0, 0))
+    var top = world2.raycast(ap.Ray(ap.Vec3(0, 5, 0), ap.Vec3(0, -1, 0)))
+    testing.assert(top.found and close_to(top.point.y, 1, 0.02))
+    world2.free()
+    testing.expect_error(NativeError, function() => world2.triangles())
+end
+
+function test_bodies_push_apart
+    var world = floor_world()
+    world.add_box(ap.Vec3(1, 0, -5), ap.Vec3(2, 3, 5))
+    var a = ap.Body(ap.Vec3(0.5, 0, 0))
+    var b = ap.Body(ap.Vec3(0.3, 0, 0))
+    settle(a, world, 10)
+    settle(b, world, 10)
+    testing.assert(a.overlaps(b))
+    a.push_apart(world, b)
+    testing.assert(not a.overlaps(b))
+    testing.assert(a.position.x <= 1 - a.radius + 0.001)        # not into the wall
+    testing.assert(close_to(a.position.x - b.position.x, a.radius + b.radius, 0.01))
+    var high = ap.Body(ap.Vec3(0.3, 2.5, 0))
+    testing.assert(not high.overlaps(b))
+end
+
+function test_cones
+    var origin = ap.Vec3(0, 0, 0)
+    var forward = ap.Vec3(0, 0, -1)
+    testing.assert(ap.in_cone(origin, forward, ap.Vec3(0, 0, -5), 75))
+    testing.assert(ap.in_cone(origin, forward, ap.Vec3(2, 0, -5), 75))    # 21.8 degrees off
+    testing.assert(not ap.in_cone(origin, forward, ap.Vec3(5, 0, -5), 75)) # 45 off
+    testing.assert(not ap.in_cone(origin, forward, ap.Vec3(0, 0, 5), 75))
+    testing.assert(ap.in_cone(origin, forward, ap.Vec3(0, 10, -1), 75))   # flat ignores height
+    testing.assert(not ap.in_cone(origin, forward, ap.Vec3(0, 10, -1), 75, false))
+end
+
+function test_sound_in_space
+    var hum = ap.tone(ap.WAVE_SINE, 220, 0.5)
+    ap.master_volume(0)
+    ap.listener(ap.Vec3(0, 0, 0), ap.Vec3(0, 0, -1))
+    var voice = hum.loop_at(ap.Vec3(3, 0, 0), 1, 1, 1, 20)
+    if not ap.has_audio() do
+        return
+    end
+    testing.assert(voice != 0 and ap.playing(voice))
+    var right = ap.ears(voice)
+    testing.assert(right.y > right.x * 4)           # on the right: mostly the right ear
+    testing.assert(right.x > 0)                     # but never only one ear
+    testing.assert(right.z < 0.01)                  # beside, not behind: clear
+    ap.move_voice(voice, ap.Vec3(-3, 0, 0))
+    var left = ap.ears(voice)
+    testing.assert(close_to(left.x, right.y, 0.0001) and close_to(left.y, right.x, 0.0001))
+    ap.move_voice(voice, ap.Vec3(0, 0, -3))
+    var front = ap.ears(voice)
+    testing.assert(close_to(front.x, front.y, 0.0001) and front.z < 0.01)
+    ap.move_voice(voice, ap.Vec3(0, 0, 3))
+    var back = ap.ears(voice)
+    testing.assert(close_to(back.x, back.y, 0.0001) and back.z > 0.99)
+    testing.assert(back.x < front.x)                # quieter behind
+    # Turning the listener around turns the sound with it.
+    ap.listener(ap.Vec3(0, 0, 0), ap.Vec3(0, 0, 1))
+    var turned = ap.ears(voice)
+    testing.assert(close_to(turned.x, front.x, 0.0001) and turned.z < 0.01)
+    # Farther is quieter, and silent from `far` on.
+    ap.move_voice(voice, ap.Vec3(0, 0, 10))
+    testing.assert(ap.ears(voice).x < front.x / 2)
+    ap.move_voice(voice, ap.Vec3(0, 0, 25))
+    testing.assert_equal(ap.ears(voice).x, 0.0)
+    ap.listen_from(ap.Camera3D(ap.Vec3(0, 0, 0), ap.Vec3(1, 0, 0)))
+    ap.move_voice(voice, ap.Vec3(3, 0, 0))
+    var ahead = ap.ears(voice)
+    testing.assert(close_to(ahead.x, ahead.y, 0.0001))
+    # It plays: a few frames later it is still going, and a one-shot one ends.
+    var blip = ap.tone(ap.WAVE_SQUARE, 880, 0.05).play_at(ap.Vec3(1, 0, 0))
+    testing.assert(blip != 0)
+    # Audio plays in real time, whatever fixed_delta says.
+    for i in 0..<100 do
+        ap.frame()
+        time.sleep(0.005)
+    end
+    testing.assert(ap.playing(voice))
+    testing.assert(not ap.playing(blip))
+    ap.stop(voice)
+    testing.assert(not ap.playing(voice))
+    ap.master_volume(1)
+    hum.free()
+end

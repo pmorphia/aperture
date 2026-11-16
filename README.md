@@ -2,11 +2,12 @@
 
 2D and 3D games in [Flywheel](https://github.com/pmorphia/flywheel): a window, input, shapes,
 sprites, text, cameras, meshes and glTF models with skeletal animation, physically based
-materials, shadows, instancing, render targets, shaders, sound and streamed music, and what
+materials, shadows, instancing, render targets, shaders, collision worlds with walking
+bodies, sound placed in space and streamed music, and what
 fighting games and other frame-exact games need: fixed-step ticks, input history with motion
 inputs, frame data, hitstop, camera shake, and debug drawing. Drawn with OpenGL through SDL3.
 
-Aperture is currently in its **beta** phase: version **2.4 (beta-4)**.
+Aperture is currently in its **beta** phase: version **2.5 (beta-5)**.
 
 ```flywheel
 import aperture as ap
@@ -271,7 +272,7 @@ end
 | `line_3d`, `grid`, `box_lines`, `billboard(texture, position, height, tint)` | lines and camera-facing sprites |
 | `wireframe(on)`, `cull(on)`, `depth_write(on)` | render state |
 | `project(point)`, `visible(point)`, `screen_ray(position)` | where a point appears on screen; the ray under the mouse |
-| `Ray.hits_sphere`, `hits_box`, `hits_plane`; `boxes_overlap`, `spheres_overlap` | picking and collisions |
+| `Ray.hits_sphere`, `hits_box`, `hits_plane`; `boxes_overlap`, `spheres_overlap` | picking and simple overlap tests (see [Collision](#collision) for levels) |
 
 ### Models and animation
 
@@ -360,6 +361,60 @@ end
 `begin_3d`. Shadows fall within `radius` of the center: smaller is sharper. Lines and
 billboards cast no shadows, and cut-out materials leave holes in them.
 
+## Collision
+
+A `World` holds solid, unmoving geometry: boxes, meshes, models, and loose triangles, in a
+bounding volume hierarchy, so tests stay cheap however big the level is. A `Body` walks
+through it.
+
+```flywheel
+var level = ap.World()
+var chapel = ap.load_model("chapel.glb")
+level.add_model(chapel)                                       # every triangle, as drawn
+level.add_box(ap.Vec3(-20, -1, -20), ap.Vec3(20, 0, 20))      # a floor
+var door = level.add_box(ap.Vec3(2, 0, -0.1), ap.Vec3(3, 2.2, 0.1))
+
+var player = ap.Body(ap.Vec3(0, 0, 0))                        # feet at the origin
+while ap.frame() do
+    while ap.tick(60) do
+        var wish = ...                                        # from input, along the ground
+        player.velocity = ap.Vec3(wish.x * 6, player.velocity.y, wish.z * 6)
+        if player.grounded and jumped do
+            player.velocity.y = 7
+        end
+        player.update(level)                                  # gravity, then move and slide
+    end
+    ...
+end
+```
+
+| `World` | |
+|---|---|
+| `add_box(low, high, group)`, `add_cube(center, size, rotation, group)` | boxes along the axes, or turned |
+| `add_mesh(mesh, position, rotation, size, group)`, `add_model(model, position, rotation, size, group)` | triangles placed as `draw` and `draw_model` place them (a model in its current pose) |
+| `add_triangles(points, group)` | three `Vec3` per triangle |
+| `group()`, `enable(group, on)`, `remove(group)`, `clear()`, `triangles()` | each add makes a group unless given one; switch a group off (an open door) or take it out |
+| `raycast(ray, reach)` | a `Hit`: `found`, `distance`, `point`, `normal` (facing the ray), `group` |
+| `sees(from, to)`, `overlaps(center, radius)` | line of sight; whether a sphere touches anything |
+| `sweep(from, to, radius)` | how far (0 to 1) a sphere gets before touching: keeps a following camera out of walls |
+| `draw(color)`, `draw_debug(color)` | the triangles' edges (`draw_debug` only while debug drawing is on) |
+
+A `Body` is an upright capsule standing on `position`: `radius` (0.35) wide and `height` (1.8)
+tall. `move(world, motion)` slides it along walls, lets it stand still on slopes up to `slope`
+degrees (50) instead of sliding down, climbs stairs and ledges up to `step` (0.3) high
+smoothly, and keeps it on the ground going down slopes and stairs up to `snap` (0.3) below
+instead of launching off them; it does none of that while jumping (moving up). After a move,
+`grounded`, `ground_normal`, `ground_group`, `hit_wall`, `wall_normal`, and `hit_ceiling` say
+what it touched. `update(world, gravity = 20)` adds gravity to `velocity`, moves by it for
+`delta()`, and takes out what went into the ground, a ceiling, or a wall. `center()` and
+`top()` give points on it, `overlaps(other)` tests two bodies, and `push_apart(world, other,
+this_one_stays)` separates them side to side without pushing either into a wall, so fighters
+and crowds cannot walk through each other.
+
+Boxes and triangles need no window, so a game server can build the same `World` as the
+players. Meshes and models are read back from the graphics card when added; a skinned model
+collides in its bind pose. Worlds are freed when no longer referenced, or by `free()`.
+
 ## Sound
 
 ```flywheel
@@ -391,6 +446,32 @@ ap.stop_music()
 
 One track plays at a time; `play_music` replaces it. `music_playing()` turns false after a
 track that does not loop ends.
+
+### Sound in space
+
+`play_at` and `loop_at` put a sound at a point, heard from a listener: louder in the ear on
+its side (never only one ear), quieter and muffled behind so front and back can be told
+apart, full volume within `near` and falling off with distance beyond it, and silent from
+`far` on (0, the default, is never silent).
+
+```flywheel
+var step = ap.load_sound("footstep.ogg")
+var fire = ap.load_sound("fire.ogg").loop_at(ap.Vec3(4, 0, -2), 0.8, 1, 2, 40)   # volume, pitch, near, far
+while ap.frame() do
+    ap.listen_from(camera)                     # or ap.listener(head, facing)
+    ap.move_voice(fire, torch.position)        # it follows what makes it
+    if landed do
+        step.play_at(enemy.position)
+    end
+end
+```
+
+The listener can move and turn each frame and every sound follows at once, gliding over about
+10 ms so nothing clicks. Stereo files are mixed to mono to be placed. `ears(voice)` tells how
+a voice is heard (x and y the ear gains, z how muffled, 0 in front to 1 behind), and
+`in_cone(origin, forward, point, degrees)` whether a point is within a cone of view (along
+the ground unless `flat` is false), for checks such as "is the player facing the sound".
+`set_volume`, `set_pitch`, `pause`, and `stop` work on voices in space too.
 
 ## Frame data
 
@@ -464,6 +545,7 @@ flywheel examples/gallery.fw      # a lit 3D scene with picking
 flywheel examples/showroom.fw     # shadows, materials, a forest of instances; add -- model.glb
 flywheel examples/skyhop.fw       # a 3D platformer: islands, moving platforms, crystals to find
 flywheel --hot examples/fighter.fw   # a fighting-game training stage: ticks, motions, frame data
+flywheel examples/crypt.fw        # walking a 3D room with stairs and slopes; a sound to turn toward
 ```
 
 `flywheel --new --game NAME` (or `pulley new NAME --game`) starts a project with Aperture as a

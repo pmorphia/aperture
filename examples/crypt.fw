@@ -1,0 +1,128 @@
+# A dark room to walk around in first person: stairs, a ramp, a slope too steep to climb, a
+# pillar, and a sound somewhere to turn toward. WASD or the left stick moves, the mouse or the
+# arrow keys turn, Space jumps, F1 shows the collision triangles, and Enter moves the sound.
+import aperture as ap
+import math
+
+ap.open("Crypt", 960, 540, ap.RESIZABLE + ap.MSAA)
+ap.capture_mouse(true)
+
+var level = ap.World()
+var stone = ap.cube()
+# Everything solid is drawn from this list and added to the world the same way.
+ap.Vec3[] lows = []
+ap.Vec3[] highs = []
+function block(ap.Vec3 low, ap.Vec3 high)
+    lows.push(low)
+    highs.push(high)
+    level.add_box(low, high)
+end
+block(ap.Vec3(-12, -1, -12), ap.Vec3(12, 0, 12))           # floor
+block(ap.Vec3(-12, 0, -12.5), ap.Vec3(12, 5, -12))         # walls
+block(ap.Vec3(-12, 0, 12), ap.Vec3(12, 5, 12.5))
+block(ap.Vec3(-12.5, 0, -12), ap.Vec3(-12, 5, 12))
+block(ap.Vec3(12, 0, -12), ap.Vec3(12.5, 5, 12))
+block(ap.Vec3(-1, 0, -1), ap.Vec3(1, 5, 1))                # pillar
+for i in 0..<8 do                                          # stairs up to a landing
+    block(ap.Vec3(4 + double(i) * 0.5, 0, -10), ap.Vec3(12, 0.2 * double(i + 1), -7))
+end
+# A walkable ramp (25 degrees) and a slope too steep to walk up (65), as triangles.
+function ramp(double x, double degrees, double z1, double z2) returns ap.Vec3[]
+    var rise = math.tan(degrees * math.PI / 180) * 4
+    return [ap.Vec3(x, 0, z1), ap.Vec3(x - 4, rise, z2), ap.Vec3(x - 4, rise, z1),
+        ap.Vec3(x, 0, z1), ap.Vec3(x, 0, z2), ap.Vec3(x - 4, rise, z2)]
+end
+ap.Vec3[] ramps = []
+for p in ramp(-4, 25, 4, 7) do
+    ramps.push(p)
+end
+for p in ramp(-4, 65, 8, 11) do
+    ramps.push(p)
+end
+level.add_triangles(ramps)
+var ramp_mesh = ap.MeshBuilder()
+for i in 0..<ramps.length // 3 do
+    var a = ramps[i * 3]
+    var b = ramps[i * 3 + 1]
+    var c = ramps[i * 3 + 2]
+    var n = (b - a).cross(c - a).normalized()
+    ramp_mesh.triangle(ramp_mesh.vertex(a, n, ap.Vec2(0, 0)), ramp_mesh.vertex(b, n, ap.Vec2(1, 1)),
+        ramp_mesh.vertex(c, n, ap.Vec2(1, 0)))
+end
+var ramp_shape = ramp_mesh.build()
+
+var player = ap.Body(ap.Vec3(0, 0, 6))
+var yaw = 0.0
+var pitch = 0.0
+var eye_height = 1.6
+
+# The sound: a low pulse looping somewhere in the room.
+var hum = ap.tone(ap.WAVE_TRIANGLE, 110, 0.6, 90, 0.6)
+var source = ap.Vec3(8, 1.5, 8)
+var voice = hum.loop_at(source, 1, 1, 2, 40)
+var marker = ap.sphere(0.15)
+
+ap.ambient(ap.Color(30, 30, 40))
+ap.light(0, ap.Vec3(0, 4, 0), ap.Color(255, 200, 150), 18)
+ap.fog(ap.Color(8, 8, 12), 6, 24)
+
+while ap.frame() do
+    if ap.key_pressed(ap.KEY_ESCAPE) do
+        ap.quit()
+    end
+    if ap.key_pressed(ap.KEY_ENTER) do
+        source = ap.Vec3(ap.random(-10, 10), 1.5, ap.random(-10, 10))
+        ap.move_voice(voice, source)
+    end
+    yaw = yaw + ap.mouse_delta().x * 0.15
+    pitch = math.clamp(pitch - ap.mouse_delta().y * 0.15, -80.0, 80.0)
+    while ap.tick(60) do
+        if ap.key_down(ap.KEY_LEFT) do
+            yaw = yaw - 120 * ap.delta()
+        end
+        if ap.key_down(ap.KEY_RIGHT) do
+            yaw = yaw + 120 * ap.delta()
+        end
+        if ap.key_down(ap.KEY_UP) do
+            pitch = math.min(pitch + 90 * ap.delta(), 80.0)
+        end
+        if ap.key_down(ap.KEY_DOWN) do
+            pitch = math.max(pitch - 90 * ap.delta(), -80.0)
+        end
+        var steer = ap.steer()
+        var y = yaw * math.PI / 180
+        var forward = ap.Vec3(math.sin(y), 0, -math.cos(y))
+        var right = ap.Vec3(math.cos(y), 0, math.sin(y))
+        var wish = forward * -steer.y + right * steer.x
+        player.velocity = ap.Vec3(wish.x * 5, player.velocity.y, wish.z * 5)
+        if player.grounded and (ap.key_pressed(ap.KEY_SPACE) or ap.pad_pressed(ap.PAD_SOUTH)) do
+            player.velocity = ap.Vec3(player.velocity.x, 6, player.velocity.z)
+        end
+        player.update(level)
+    end
+
+    var eye = player.position + ap.Vec3(0, eye_height, 0)
+    var camera = ap.look(eye, yaw, pitch)
+    ap.listen_from(camera)
+    var facing = ap.in_cone(eye, camera.forward(), source, 75)
+
+    ap.clear(ap.Color(8, 8, 12))
+    ap.begin_3d(camera)
+    for i in 0..<lows.length do
+        var low = lows[i]
+        var high = highs[i]
+        ap.draw(stone, (low + high) * 0.5, ap.Color(120, 115, 110), ap.Vec3(0, 0, 0), high - low)
+    end
+    ap.draw(ramp_shape, ap.Vec3(0, 0, 0), ap.Color(110, 100, 90))
+    ap.draw(marker, source, ap.ORANGE if facing else ap.Color(90, 40, 20))
+    level.draw_debug(ap.GREEN)
+    ap.end_3d()
+
+    var ears = ap.ears(voice)
+    var where = "on the ground" if player.grounded else "in the air"
+    ap.text("{int(ap.fps())} fps   {where}", 12, 12)
+    ap.text("left {ears.x:.2f}  right {ears.y:.2f}  behind {ears.z:.2f}", 12, 32)
+    ap.text("FACING THE SOUND" if facing else "find the sound", 12, 52, 16,
+        ap.ORANGE if facing else ap.GRAY)
+end
+ap.close()
