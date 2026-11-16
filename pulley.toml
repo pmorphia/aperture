@@ -1,11 +1,11 @@
 [package]
 name = "aperture"
 author = "polymorphia"
-version = "2.4"
-description = "2D and 3D games in Flywheel: window, input, sprites, text, meshes, glTF models with animation, PBR materials, shadows, instancing, sound and streamed Ogg music, fixed-step ticks, input history with motion inputs, frame data, hitstop, shake, debug drawing"
+version = "2.5"
+description = "2D and 3D games in Flywheel: window, input, sprites, text, meshes, glTF models with animation, PBR materials, shadows, instancing, collision worlds with walking bodies, sound in space and streamed Ogg music, fixed-step ticks, input history with motion inputs, frame data, hitstop, shake, debug drawing"
 main = "aperture.fw"
 license = "MIT"
-exclude = ["tests/*", "tools/*", ".gitignore", "shots/*"]
+exclude = ["tests/*", "tools/*", "examples/*", ".gitignore", "shots/*"]
 
 [scripts]
 test = "flywheel --test tests/"
